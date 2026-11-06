@@ -1,0 +1,1285 @@
+<!DOCTYPE html><head>
+<title>Murmuration - LittleJS</title>
+<meta charset=utf-8>
+</head><body style=background:#000>
+<!-- LittleJS (a copy of the release build this demo was made with) and its sound helpers -->
+<script src=littlejs.js></script>
+<script src=gameFx.js></script>
+<script>
+'use strict';
+
+///////////////////////////////////////////////////////////////////////////////
+// SIM BEGIN - a 3D starling flock, plain math only so node can run it too
+//
+// Birds steer by a coarse 3D grid instead of searching neighbors: each frame
+// every cell sums its birds' count, velocity, position and panic, and a bird
+// reads its own cell plus the six it touches. Alignment and cohesion come from
+// those averages, separation from the density gradient. O(N), so tens of
+// thousands of birds run at 60fps.
+
+const MAX_BIRDS = 60000;
+let birdCount = 40000;
+
+const bpx = new Float32Array(MAX_BIRDS), bpy = new Float32Array(MAX_BIRDS), bpz = new Float32Array(MAX_BIRDS);
+const bvx = new Float32Array(MAX_BIRDS), bvy = new Float32Array(MAX_BIRDS), bvz = new Float32Array(MAX_BIRDS);
+const bsize  = new Float32Array(MAX_BIRDS); // wingspan in meters
+const bphase = new Float32Array(MAX_BIRDS); // wing flap phase
+const bpanic = new Float32Array(MAX_BIRDS); // 0 calm .. 1 fleeing, spreads through the flock as a wave
+const bcool  = new Float32Array(MAX_BIRDS); // seconds until this bird can catch panic again
+const bgone  = new Uint8Array(MAX_BIRDS);   // 1 once it has flown away out of the scene
+const bleave = new Uint8Array(MAX_BIRDS);   // 1 once it has left the flock for the departure point
+const departKeys = new Float64Array(MAX_BIRDS);
+const bgroup = new Uint8Array(MAX_BIRDS);   // which attractor pulls this bird
+const bcell  = new Int32Array(MAX_BIRDS);
+
+// grid, 4m cells over x -80..80, y -8..72, z -60..60
+const CELL = 4, GX = 40, GY = 20, GZ = 30, GXY = GX*GY, GN = GX*GY*GZ;
+const GOX = -GX*CELL/2, GOY = -8, GOZ = -GZ*CELL/2;
+const gridCount = new Float32Array(GN), gridPanic = new Float32Array(GN);
+const gridVX = new Float32Array(GN), gridVY = new Float32Array(GN), gridVZ = new Float32Array(GN);
+const gridPX = new Float32Array(GN), gridPY = new Float32Array(GN), gridPZ = new Float32Array(GN);
+
+// steering weights
+const K_ALIGN = 1.4, K_COHESION = .7, K_SEPARATE = .18, K_WANDER = 1;
+const K_ATTRACT = 26, ATTRACT_RADIUS = 8;
+
+// a slowly changing ABC flow, divergence free so it stretches and folds the flock
+// into sheets and ribbons without bunching it up, the way a real murmuration moves
+const K_FLOW = 1.2, FLOW_SPEED = 11, FLOW_SCALE = .07, FLOW_DRIFT = .15;
+const SPEED_MIN = 8, SPEED_MAX = 13, SPEED_PANIC = 12;
+const HAWK_RADIUS = 10, HAWK_BURST_RADIUS = 22, K_HAWK = 150;
+// leaving at dusk: both of the flock's attractors slide over DEPART_GATHER seconds to one gate DEPART_GATE meters
+// from its middle toward the departure point, so the flock pours toward it as one, and the birds peel off one after
+// another in a long stream, always those nearest the departure point: a few at first, then a steady flow, all gone
+// DEPART_STREAM_TIME seconds after the first second and a half; each streams away for that point, high over the mountains; past
+// simDepart.descend from the lake's middle (beyond the far mountains) it turns down, and it is gone once it is as far
+// out as the point. DEPART_SPREAD spreads their aims so the stream is a ribbon, not a line
+const DEPART_STREAM_TIME = 9, DEPART_GATHER = 3, DEPART_GATE = 35, SPEED_DEPART = 26, K_DEPART_STEER = 2.5, DEPART_GONE = 40, DEPART_SPREAD = 60;
+// past FAR_RADIUS from the lake's middle every bird may fly faster, FAR_SPEEDUP m/s more each meter: at that distance
+// it doesn't show, and it brings a leaving flock to the hills (or a returning one back) in seconds, not minutes
+const FAR_RADIUS = 60, FAR_SPEEDUP = .2;
+const simDepart = {active:false, age:0, left:0, x:0, y:0, z:0, descend:Infinity, gateX:0, gateY:0, gateZ:0};
+const PANIC_DECAY = .94, PANIC_THRESHOLD = .12, PANIC_CATCH = .1, PANIC_REFRACTORY = 2, K_JINK = 6;
+
+// per cell steering cache, filled the first time a frame touches a cell
+const cellAX = new Float32Array(GN), cellAY = new Float32Array(GN), cellAZ = new Float32Array(GN);
+const cellPanic = new Float32Array(GN), cellFrame = new Int32Array(GN);
+
+let simTime = 0, simFrame = 0, simSeed = 1;
+// fast xorshift random 0..1, the sim calls it about four times per bird per frame
+function simRandom()
+{
+    simSeed ^= simSeed << 13; simSeed ^= simSeed >>> 17; simSeed ^= simSeed << 5;
+    return (simSeed >>> 0)/4294967296;
+}
+const flockCenter = {x:0, y:20, z:0};
+
+// the hawk is a ray from the eye through a point, birds near the ray flee
+const simHawk = {active:false, ex:0, ey:0, ez:0, hx:0, hy:0, hz:0, burst:0};
+
+// two slowly drifting points the flock is pulled toward, so it stays in view and splits and merges
+function attractorPos(g, t)
+{
+    return {
+        x: 30*Math.sin(t*.05 + g*2.1) + 10*Math.sin(t*.13 + g),
+        y: 29 + 4*Math.sin(t*.09 + g*1.3),
+        z: 18*Math.sin(t*.07 + g*3.7),
+    };
+}
+
+function spawnFlock(seed=1)
+{
+    simDepart.active = false, simDepart.age = 0;
+    let s = seed*9301 + 49297;
+    const r = ()=> (s = (s*16807) % 2147483647) / 2147483647;
+    for (let i = 0; i < MAX_BIRDS; ++i)
+    {
+        const g = bgroup[i] = i & 1;
+        const a = attractorPos(g, simTime);
+        // a random point in a squashed ball around the attractor
+        const u = r()*2 - 1, theta = r()*Math.PI*2, rad = Math.cbrt(r()), ring = Math.sqrt(1 - u*u)*rad;
+        bpx[i] = a.x + Math.cos(theta)*ring*16;
+        bpy[i] = a.y + u*rad*6;
+        bpz[i] = a.z + Math.sin(theta)*ring*12;
+        bvx[i] = 10 + (r()-.5)*3;
+        bvy[i] = (r()-.5)*2;
+        bvz[i] = 3 + (r()-.5)*3;
+        bsize[i] = .3 + r()*.12;
+        bphase[i] = r()*100;
+        bpanic[i] = bcool[i] = bgone[i] = bleave[i] = 0;
+    }
+}
+
+function simStep(dt)
+{
+    simTime += dt;
+    const n = birdCount;
+
+    // fill the grid
+    gridCount.fill(0); gridPanic.fill(0);
+    gridVX.fill(0); gridVY.fill(0); gridVZ.fill(0);
+    gridPX.fill(0); gridPY.fill(0); gridPZ.fill(0);
+    let cx = 0, cy = 0, cz = 0, flying = 0;
+    for (let i = 0; i < n; ++i)
+    {
+        if (bgone[i]) continue;
+        ++flying;
+
+        cx += bpx[i]; cy += bpy[i]; cz += bpz[i];
+
+        // a bird well outside the grid (leaving, or coming back from far away) doesn't flock
+        let ix = Math.floor((bpx[i] - GOX)/CELL), iy = Math.floor((bpy[i] - GOY)/CELL), iz = Math.floor((bpz[i] - GOZ)/CELL);
+        if (ix < 0 || ix >= GX || iy < 0 || iy >= GY || iz < 0 || iz >= GZ)
+        {
+            bcell[i] = -1;
+            continue;
+        }
+        // clamped one cell in from the edge so all six neighbors exist
+        ix = ix < 1 ? 1 : ix > GX-2 ? GX-2 : ix;
+        iy = iy < 1 ? 1 : iy > GY-2 ? GY-2 : iy;
+        iz = iz < 1 ? 1 : iz > GZ-2 ? GZ-2 : iz;
+        const c = bcell[i] = ix + iy*GX + iz*GXY;
+        gridCount[c]++;
+        gridVX[c] += bvx[i]; gridVY[c] += bvy[i]; gridVZ[c] += bvz[i];
+        gridPX[c] += bpx[i]; gridPY[c] += bpy[i]; gridPZ[c] += bpz[i];
+        gridPanic[c] += bpanic[i];
+    }
+    flockCenter.flying = flying;
+    if (flying)
+        flockCenter.x = cx/flying, flockCenter.y = cy/flying, flockCenter.z = cz/flying;
+    if (simDepart.active)
+    {
+        // every few frames the birds that are due leave: those still in the flock nearest the departure point, found
+        // by sorting them by distance (to a sixteenth of a meter, with the index in the low bits)
+        if (!simDepart.age)
+        {
+            const dx = simDepart.x - flockCenter.x, dz = simDepart.z - flockCenter.z, l = Math.sqrt(dx*dx + dz*dz) || 1;
+            simDepart.left = 0;
+            simDepart.gateX = flockCenter.x + dx/l*DEPART_GATE;
+            simDepart.gateY = 32;
+            simDepart.gateZ = flockCenter.z + dz/l*DEPART_GATE;
+        }
+        simDepart.age += dt;
+        // slow at first, then steady: age squared over (age + 1.5) is about age - 1.5 once past the first seconds
+        const age = simDepart.age, share = Math.min(1, age*age/(age + 1.5)/DEPART_STREAM_TIME), due = Math.ceil(n*share);
+        if (due > simDepart.left && (simFrame % 4 == 0 || share == 1))
+        {
+            let count = 0;
+            for (let i = 0; i < n; ++i)
+            {
+                if (bgone[i] || bleave[i]) continue;
+                const dx = simDepart.x - bpx[i], dy = simDepart.y - bpy[i], dz = simDepart.z - bpz[i];
+                const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                departKeys[count++] = Math.floor(d*16)*65536 + i;
+            }
+            const keys = departKeys.subarray(0, count).sort(), go = Math.min(count, due - simDepart.left);
+            for (let k = 0; k < go; ++k)
+                bleave[keys[k] % 65536] = 1;
+            simDepart.left += go;
+        }
+        simDepart.goneRadius = Math.hypot(simDepart.x, simDepart.z) - DEPART_GONE;
+    }
+
+    const a0 = attractorPos(0, simTime), a1 = attractorPos(1, simTime);
+    if (simDepart.active)
+    {
+        // gathering at the gate
+        let u = Math.min(1, simDepart.age/DEPART_GATHER);
+        u = u*u*(3 - 2*u);
+        for (const a of [a0, a1])
+            a.x += (simDepart.gateX - a.x)*u, a.y += (simDepart.gateY - a.y)*u, a.z += (simDepart.gateZ - a.z)*u;
+    }
+    const flowPhaseX = simTime*FLOW_DRIFT, flowPhaseY = simTime*FLOW_DRIFT*.7 + 1, flowPhaseZ = simTime*FLOW_DRIFT*1.3 + 2;
+    const h = simHawk;
+    h.burst = Math.max(0, h.burst - dt*1.2);
+    const hawkR = HAWK_RADIUS + h.burst*HAWK_BURST_RADIUS, hawkR2 = hawkR*hawkR;
+    let hux = h.hx - h.ex, huy = h.hy - h.ey, huz = h.hz - h.ez;
+    const hul = Math.sqrt(hux*hux + huy*huy + huz*huz) || 1;
+    hux /= hul; huy /= hul; huz /= hul;
+
+    ++simFrame;
+    for (let i = 0; i < n; ++i)
+    {
+        if (bgone[i]) continue;
+        const c = bcell[i];
+        const px = bpx[i], py = bpy[i], pz = bpz[i];
+        let vx = bvx[i], vy = bvy[i], vz = bvz[i];
+
+        // the parts of the steering every bird in a cell shares, worked out once per cell per frame
+        if (c >= 0 && cellFrame[c] !== simFrame)
+        {
+            cellFrame[c] = simFrame;
+
+            // own cell plus its six face neighbors
+            const c0 = c-1, c1 = c+1, c2 = c-GX, c3 = c+GX, c4 = c-GXY, c5 = c+GXY;
+            const inv = 1/(gridCount[c] + gridCount[c0] + gridCount[c1] + gridCount[c2] + gridCount[c3] + gridCount[c4] + gridCount[c5]);
+            const avx = (gridVX[c] + gridVX[c0] + gridVX[c1] + gridVX[c2] + gridVX[c3] + gridVX[c4] + gridVX[c5])*inv;
+            const avy = (gridVY[c] + gridVY[c0] + gridVY[c1] + gridVY[c2] + gridVY[c3] + gridVY[c4] + gridVY[c5])*inv;
+            const avz = (gridVZ[c] + gridVZ[c0] + gridVZ[c1] + gridVZ[c2] + gridVZ[c3] + gridVZ[c4] + gridVZ[c5])*inv;
+            const apx = (gridPX[c] + gridPX[c0] + gridPX[c1] + gridPX[c2] + gridPX[c3] + gridPX[c4] + gridPX[c5])*inv;
+            const apy = (gridPY[c] + gridPY[c0] + gridPY[c1] + gridPY[c2] + gridPY[c3] + gridPY[c4] + gridPY[c5])*inv;
+            const apz = (gridPZ[c] + gridPZ[c0] + gridPZ[c1] + gridPZ[c2] + gridPZ[c3] + gridPZ[c4] + gridPZ[c5])*inv;
+            cellPanic[c] = (gridPanic[c] + gridPanic[c0] + gridPanic[c1] + gridPanic[c2] + gridPanic[c3] + gridPanic[c4] + gridPanic[c5])*inv;
+
+            // the flow at the cell center
+            const fx = apx*FLOW_SCALE + flowPhaseX, fy = apy*FLOW_SCALE*1.5 + flowPhaseY, fz = apz*FLOW_SCALE + flowPhaseZ;
+            const ux = Math.sin(fz) + .7*Math.cos(fy);
+            const uy = .5*(Math.sin(fx) + Math.cos(fz));
+            const uz = .7*Math.sin(fy) + Math.cos(fx);
+
+            // alignment, cohesion, separation from the density gradient, flow, less what depends on the bird
+            cellAX[c] = avx*K_ALIGN + apx*K_COHESION - (gridCount[c1] - gridCount[c0])*K_SEPARATE + ux*FLOW_SPEED*K_FLOW;
+            cellAY[c] = avy*K_ALIGN + apy*K_COHESION - (gridCount[c3] - gridCount[c2])*K_SEPARATE + uy*FLOW_SPEED*.6*K_FLOW;
+            cellAZ[c] = avz*K_ALIGN + apz*K_COHESION - (gridCount[c5] - gridCount[c4])*K_SEPARATE + uz*FLOW_SPEED*K_FLOW;
+        }
+        const damp = K_ALIGN + K_FLOW;
+        let ax = 0, ay = 0, az = 0, avgPanic = 0;
+        if (c >= 0)
+        {
+            ax = cellAX[c] - vx*damp - px*K_COHESION;
+            ay = cellAY[c] - vy*damp - py*K_COHESION;
+            az = cellAZ[c] - vz*damp - pz*K_COHESION;
+            avgPanic = cellPanic[c];
+        }
+        // far from the lake every bird may fly faster, see FAR_SPEEDUP
+        const far = Math.sqrt(px*px + pz*pz) - FAR_RADIUS, farSpeed = far > 0 ? far*FAR_SPEEDUP : 0;
+
+        // wander
+        ax += (simRandom() - .5)*K_WANDER;
+        ay += (simRandom() - .5)*K_WANDER*.5;
+        az += (simRandom() - .5)*K_WANDER;
+
+        // leaving: once its turn comes a bird steers (not pulls, so it never orbits) for its own aim near the
+        // departure point, and is gone when it gets there
+        let departing = false;
+        if (simDepart.active)
+        {
+            const spread = (bphase[i] % 1 - .5)*DEPART_SPREAD;
+            // over the mountains, then down once past them
+            const aimY = px*px + pz*pz > simDepart.descend*simDepart.descend ? -500 : simDepart.y + (bsize[i] - .36)*200;
+            const dx = simDepart.x + spread - px, dy = aimY - py, dz = simDepart.z - pz;
+            const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 1e-3;
+            departing = bleave[i] == 1;
+            if (departing)
+            {
+                if (px*px + pz*pz > simDepart.goneRadius*simDepart.goneRadius)
+                {
+                    bgone[i] = 1;
+                    continue;
+                }
+                const g = (SPEED_DEPART + farSpeed)/d;
+                ax = (dx*g - vx)*K_DEPART_STEER; ay = (dy*g - vy)*K_DEPART_STEER; az = (dz*g - vz)*K_DEPART_STEER;
+            }
+        }
+        if (!departing)
+        {
+            // pull toward this bird's attractor once outside its radius
+            const a = bgroup[i] ? a1 : a0;
+            const dx = a.x - px, dy = a.y - py, dz = a.z - pz;
+            const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 1e-3;
+            if (d > ATTRACT_RADIUS)
+            {
+                const f = Math.min((d - ATTRACT_RADIUS)*.3, 1)*K_ATTRACT/d;
+                ax += dx*f; ay += dy*f*.6; az += dz*f;
+            }
+
+            // birds fly mostly level, and keep off the water and out of the clouds
+            ay -= vy*.8;
+            if (py < 20) ay += (20 - py)*.8;
+            if (py > 46) ay -= (py - 46)*2;
+        }
+
+        // the panic wave, an excitable medium like real murmurations: a bird whose neighbors are
+        // panicking catches it, flares, calms, and can't catch it again for a while, so each
+        // scare sweeps across the flock once as a dark band of banking birds
+        let panic = bpanic[i]*PANIC_DECAY, cool = bcool[i] - dt;
+        if (cool <= 0 && avgPanic > PANIC_THRESHOLD && simRandom() < PANIC_CATCH)
+            panic = 1, cool = PANIC_REFRACTORY;
+
+        // flee the hawk's ray
+        if (h.active)
+        {
+            const wx = px - h.ex, wy = py - h.ey, wz = pz - h.ez;
+            const t = wx*hux + wy*huy + wz*huz;
+            const ox = wx - hux*t, oy = wy - huy*t, oz = wz - huz*t;
+            const o2 = ox*ox + oy*oy + oz*oz;
+            if (o2 < hawkR2 && t > 0)
+            {
+                const o = Math.sqrt(o2) + 1e-3;
+                const f = K_HAWK*(1 - o/hawkR)/o;
+                ax += ox*f; ay += oy*f; az += oz*f;
+                panic = 1, cool = PANIC_REFRACTORY;
+            }
+        }
+        bpanic[i] = panic;
+        bcool[i] = cool;
+
+        // a panicking bird jinks upward, so the band ripples the flock's shape as it passes
+        ay += panic*K_JINK;
+
+        vx += ax*dt; vy += ay*dt; vz += az*dt;
+        const speed = Math.sqrt(vx*vx + vy*vy + vz*vz) + 1e-3;
+        const maxSpeed = (departing ? SPEED_DEPART : SPEED_MAX + panic*SPEED_PANIC) + farSpeed;
+        const s = speed < SPEED_MIN ? SPEED_MIN/speed : speed > maxSpeed ? maxSpeed/speed : 1;
+        vx *= s; vy *= s; vz *= s;
+
+        bvx[i] = vx; bvy[i] = vy; bvz[i] = vz;
+        bpx[i] = px + vx*dt; bpy[i] = py + vy*dt; bpz[i] = pz + vz*dt;
+    }
+}
+// SIM END
+///////////////////////////////////////////////////////////////////////////////
+
+// camera: the eye sits just above the lake looking level at the flock, with the horizon a quarter of the way up the
+// frame; VIEW_HEIGHT world units tall at FOCAL, the framing the 2D version had (tools/flockSheet.js reads this line)
+const VIEW_HEIGHT = 36, HORIZON_Y = -9, FOCAL = 66, EYE_Y = 3, CAM_DIST = 150;
+const CAM_FOV = 2*Math.atan(VIEW_HEIGHT/2/FOCAL), CAM_PITCH = Math.atan(-HORIZON_Y/FOCAL);
+// the camera stands still, facing -Z across the lake toward the sunset; F flies it freely (WASD, drag to look, Q/E
+// down and up, Shift faster), and camYaw is then the way it faces, so the hawk's passes cross its view
+let camYaw = 0, freeCam = false;
+const freeCamPos = vec3(), freeLook = {yaw: 0, pitch: 0};
+const FREE_CAM_SPEED = 25, FREE_CAM_FAST = 120, FREE_CAM_TURN = .003;
+let hudVisible = true, autoHawk = true, slowMo = false;
+let lastMouseMove = -1e9, flockSeed = 1, soundStarted = false, fpsSmooth = 60, lastFrameTime = 0, titleStart = -1e9;
+
+// ?cinematic: a hands free 32 second shot for video - title, three hawk passes, the flock flies away, end card
+const cinematic = location.search.includes('cinematic');
+const CINE_LENGTH = 32, CINE_END_CARD = 27, CINE_DEPART = 20.5;
+const CINE_PASSES = [{time: 6, angle: 0}, {time: 11.5, angle: -.7}, {time: 16.5, angle: 3.5}];
+
+// directions round the lake are azimuths: 0 looks down -Z, the way the camera faces at the middle of its swing,
+// and they grow to the right, so a direction is (sin(a), 0, -cos(a))
+// the sun is not placed here: placeSun finds the lowest point of the ridge within SUN_SEARCH of SUN_AZIMUTH and
+// sets it there, its lower edge SUN_CLEARANCE of its radius above the ridge
+const SUN_AZIMUTH = .1, SUN_SEARCH = .22, SUN_RADIUS = .024, SUN_CLEARANCE = 1.2;
+let sunAzimuth = SUN_AZIMUTH, sunElevation = .04;
+const skyZenith = rgb(.03,.035,.12), skyTop = rgb(.06,.07,.2), skyMid = rgb(.5,.3,.45), skyHorizon = rgb(1,.6,.35);
+const FOG_COLOR = rgb(.78,.47,.43), FOG_START = 250, FOG_END = 2600;
+
+// the terrain: a height map TERRAIN_SIZE meters across centered on the lake, so it rings it, a sample every TERRAIN_CELL
+// meters; heights from TERRAIN_BASE under the water to TERRAIN_HEIGHT, ridges about TERRAIN_FEATURE meters apart
+const TERRAIN_SIZE = vec2(6000, 6000), TERRAIN_CELL = 10;
+const TERRAIN_HEIGHT = 400, TERRAIN_BASE = 12, TERRAIN_FEATURE = 260, TERRAIN_MASSIF = 1000;
+// the lake bed rises to the water over the last 60m before LAKE_SHORE meters from the middle
+const LAKE_SHORE = 430;
+
+// the water: its own dark color where you look down into it, more mirror toward the horizon (Fresnel), and a sharp
+// highlight; its reflection is drawn WATER_REFLECTION_SIZE pixels a cube face, again every WATER_REFLECTION_EVERY frames
+const WATER_COLOR = rgb(.05,.04,.1), WATER_REFLECTIVITY = .35, WATER_SPECULAR = 0;
+const WATER_REFLECTION_SIZE = 512, WATER_REFLECTION_EVERY = 1;
+// the waves: each of the seven sets' slope near the camera, calming to half of it over WATER_CALM_DISTANCE meters
+const WATER_WAVE_SLOPE = +(new URLSearchParams(location.search).get('slope') || .02), WATER_CALM_DISTANCE = 40;
+
+// the flock leaves at the end for a point left of the sun, past the far mountains, seen from the camera DEPART_ABOVE
+// radians over the ridge line there: flying straight for it from above, it settles toward the peaks as it goes, and
+// stays clear of them. It turns down past DEPART_DESCEND from the lake's middle, beyond the far mountains
+const DEPART_AZIMUTH = -.38, DEPART_DISTANCE = 3400, DEPART_DESCEND = 3000, DEPART_ABOVE = .015;
+
+// the reed bed: a bank in front of the camera, and an island on the far shore
+const BANK_RADIUS = 133, BANK_ARC = .35, ISLAND_X = -22, ISLAND_Z = -45, ISLAND_RADIUS = 16;
+const NEAR_REEDS = 500, ISLAND_REEDS = 600, REED_COUNT = NEAR_REEDS + ISLAND_REEDS;
+const REED_COLOR = rgb(.03,.017,.035), BANK_COLOR = rgb(.035,.02,.04);
+// a cattail's head, as fractions of its stalk: its middle REED_HEAD_HEIGHT of the way up, REED_HEAD_LENGTH long (so
+// the bare spike above it is 1 - HEIGHT - LENGTH/2), and REED_HEAD_WIDTH times the stalk's width
+const REED_HEAD_HEIGHT = .91, REED_HEAD_LENGTH = .12, REED_HEAD_WIDTH = 2.8;
+
+// birds: a little chevron mesh, flapping by scaling its height through zero and out the other side
+const BIRD_SCALE = 2, BIRD_FLAP_RATE = 26, HAWK_SPAN = 3;
+const birdNear = rgb(.03,.02,.05), birdFar = rgb(.3,.2,.3), birdHaze = rgb(.55,.35,.4);
+
+let birdMesh, birdSet, birdColorCursor = 0;
+let hawkObject, hawkVisible = false;
+// the way the hawk flies across the screen, along the camera's right and up, eased so it turns smoothly
+const hawkDir = vec2(1, 0);
+// how far it banks, eased: into its turns, and a slow sway of its own
+let hawkBank = 0;
+// an autopilot pass: the hawk comes in from off screen, slowing to the 2D version's speed (screen units a second)
+// for the strike, and speeds away off screen again, HAWK_PASS_HALF seconds each side of it (short enough that the
+// cinematic's passes, 5.5 seconds apart, don't cut each other off); it only scatters the birds near the strike, as
+// the 2D one did. Its path swoops: down into the strike and up out of it, HAWK_SWOOP screen units up for every
+// screen unit squared along
+const HAWK_PASS_SPEED = 48/3.5, HAWK_PASS_REACH = 1.75, HAWK_PASS_HALF = 2.7, HAWK_PASS_ACCEL = 14, HAWK_SWOOP = .006;
+const hawkPos = vec3(0, 30, 0), hawkFlap = {t:0};
+let lake, waterReflection, stalkSet, headSet, leafSet;
+
+// per reed: base, stalk height and width, its sway, and two leaves
+const reedX = new Float32Array(REED_COUNT), reedY = new Float32Array(REED_COUNT), reedZ = new Float32Array(REED_COUNT);
+const reedH = new Float32Array(REED_COUNT), reedW = new Float32Array(REED_COUNT);
+const reedLean = new Float32Array(REED_COUNT), reedPhase = new Float32Array(REED_COUNT);
+const reedHead = new Uint8Array(REED_COUNT);
+
+// smooth 1D value noise
+function mmHash(i) { const s = Math.sin(i*127.1 + 311.7)*43758.5453; return s - Math.floor(s); }
+function mmNoise(x)
+{
+    const i = Math.floor(x), f = x - i, u = f*f*(3 - 2*f);
+    return mmHash(i)*(1 - u) + mmHash(i + 1)*u;
+}
+const smoothRamp = x => (x = clamp(x), x*x*(3 - 2*x));
+const azimuthDelta = (a, b) => { const d = (a - b) % (2*PI); return d > PI ? d - 2*PI : d < -PI ? d + 2*PI : d; };
+
+// sounds
+const windSound = new SoundGenerator({shape:4, frequency:80, attack:1, sustain:3, release:1, filter:-500, randomness:0, volume:.5});
+const whooshSound = new SoundGenerator({shape:4, frequency:300, attack:.08, release:.7, filter:-1400, volume:.8});
+
+///////////////////////////////////////////////////////////////////////////////
+// the scene, built once
+
+// the sky's color one way, mirrored below the horizon so the lake shows it reflected
+function skyColor(azimuth, elevation)
+{
+    const deg = Math.abs(elevation)*180/PI;
+    let c = deg < 13 ? skyHorizon.lerp(skyMid, (deg/13)**.8) :
+        deg < 27 ? skyMid.lerp(skyTop, (deg - 13)/14) : skyTop.lerp(skyZenith, Math.min(1, (deg - 27)/50));
+
+    // the sun's glow, wide along the horizon, and a brighter core round it
+    const da = azimuthDelta(azimuth, sunAzimuth), de = Math.abs(elevation) - sunElevation;
+    const wide = Math.max(0, 1 - Math.hypot(da/.45, de/.2)), core = Math.max(0, 1 - Math.hypot(da/.1, de/.068));
+    c = c.lerp(rgb(1,.7,.45), wide*.5);
+    c = c.lerp(rgb(1,.85,.6), core*.6);
+
+    // thin clouds lit from below, warmer the lower they sit, each a row of soft puffs as the 2D version drew them
+    const deg2 = Math.abs(elevation)*180/PI;
+    for (const w of cloudWisps)
+    {
+        const dw = azimuthDelta(azimuth, w.azimuth);
+        if (Math.abs(dw) > w.length*.7) continue;
+        const low = 1 - (w.elevation - 2)/12;
+        let cover = 0;
+        for (let k = 0; k < 7; ++k)
+        {
+            const o = (k/6 - .5)*w.length, bulge = 1 - Math.abs(k/6 - .5)*1.4;
+            const thick = w.thick*(.5 + .7*mmHash(w.seed + k*3))*bulge/2, long = w.length*.35/2;
+            const dy = deg2 - (w.elevation + (mmHash(w.seed + k) - .5)*w.thick*.6), dx = dw*180/PI - o;
+            const r2 = (dx/long)**2 + (dy/thick)**2;
+            if (r2 < 1) cover += (1 - r2)**1.5;
+        }
+        if (cover)
+            c = c.lerp(rgb(.85 + .15*low, .5 + .25*low, .55), Math.min(1, cover)*(.12 + .2*low));
+    }
+    return c;
+}
+
+// the cloud wisps, in degrees, as the 2D version placed them across its view
+const cloudWisps = [];
+for (let k = 0; k < 9; ++k)
+    cloudWisps.push({azimuth: (mmHash(k*2.7) - .5)*1.9, elevation: 2.5 + mmHash(k*6.1)*10, length: 7 + mmHash(k*1.3)*13,
+        thick: .35 + mmHash(k*8.9)*.45, seed: k*13});
+
+// a dome round the camera, dense near the horizon where the glow changes fastest, with the sun and its reflection
+function buildDuskSky()
+{
+    const mesh = new Mesh, SIDES = 256, rows = [];
+    // finest where the clouds' thin streaks sit
+    for (let e = 0; e < .35; e += e > .03 && e < .25 ? .004 : .01) rows.push(e);
+    for (let e = .35; e < PI/2; e += .06) rows.push(e);
+    rows.push(PI/2);
+    const elevations = [...rows.slice(1).reverse().map(e => -e), ...rows];
+    const up = vec3(0, 1, 0);
+    for (let j = 0; j < elevations.length - 1; ++j)
+    {
+        const points = [], colors = [];
+        for (let i = 0; i <= SIDES; ++i)
+        {
+            const a = i/SIDES*2*PI;
+            for (const e of [elevations[j+1], elevations[j]])
+            {
+                points.push(vec3(Math.sin(a)*Math.cos(e), Math.sin(e), -Math.cos(a)*Math.cos(e)));
+                colors.push(skyColor(a, e));
+            }
+        }
+        mesh.addStrip(points, up, undefined, colors);
+    }
+
+    // the sun's disc, a fan just inside the dome, and the same again below the horizon
+    for (const side of [1, -1])
+    {
+        const points = [], colors = [], e = sunElevation*side, a = sunAzimuth;
+        const center = vec3(Math.sin(a)*Math.cos(e), Math.sin(e), -Math.cos(a)*Math.cos(e)).scale(.99);
+        const right = vec3(Math.cos(a), 0, Math.sin(a)), upward = vec3(-Math.sin(a)*Math.sin(e), Math.cos(e), Math.cos(a)*Math.sin(e));
+        for (let i = 0; i <= 32; ++i)
+        {
+            const t = i/32*2*PI;
+            points.push(center, center.add(right.scale(Math.cos(t)*SUN_RADIUS*.99)).add(upward.scale(Math.sin(t)*SUN_RADIUS*.99)));
+            colors.push(rgb(1,.98,.9), rgb(1,.9,.7));
+        }
+        mesh.addStrip(points, up, undefined, colors);
+    }
+    mesh.doubleSided = true;
+    return mesh;
+}
+
+// smooth 2D value noise, and ridged noise from it: sharp crests and soft valleys, 0..~1; each octave is turned a
+// little so the cells' grid never lines up
+function mmHash2(x, z) { const s = Math.sin(x*127.1 + z*311.7)*43758.5453; return s - Math.floor(s); }
+function mmNoise2(x, z)
+{
+    const i = Math.floor(x), j = Math.floor(z), fx = x - i, fz = z - j;
+    const u = fx*fx*(3 - 2*fx), v = fz*fz*(3 - 2*fz);
+    const a = mmHash2(i, j), b = mmHash2(i + 1, j), c = mmHash2(i, j + 1), d = mmHash2(i + 1, j + 1);
+    return a + (b - a)*u + (c - a)*v + (a - b - c + d)*u*v;
+}
+function ridgeNoise2(x, z)
+{
+    let sum = 0, weight = .5;
+    for (let o = 0; o < 6; ++o, weight *= .5)
+    {
+        sum += weight*(1 - Math.abs(2*mmNoise2(x, z) - 1))**2;
+        const t = x;
+        x = (x*.8 - z*.6)*2.03 + 17.1, z = (t*.6 + z*.8)*2.03 + 5.3;
+    }
+    return sum;
+}
+
+// the land round the lake, in meters: under the water out to the far shore, then ranges stepping up with distance -
+// low hills off to the sides, a middle range, and the big peaks at the back, all of it ridged
+function terrainHeight(x, z)
+{
+    const r = Math.hypot(x, z), a = Math.atan2(x, -z);
+    const side = smoothRamp((Math.abs(a) - .16)/.3);
+    const near = side*14*smoothRamp((r - 430)/90);
+    const middle = 55*smoothRamp((r - 700)/150);
+    const back = (110 + Math.max(0, r - 1400)*.08)*smoothRamp((r - 1250)/280);
+    const envelope = Math.max(near, middle, back);
+    const ridges = .25 + .9*ridgeNoise2(x/TERRAIN_FEATURE + 3, z/TERRAIN_FEATURE + 7);
+    // broad swells over the ridges, a kilometer or so across: big massifs in places, low saddles between
+    const massif = mmNoise2(x/TERRAIN_MASSIF + 11, z/TERRAIN_MASSIF + 23), lift = .15 + 1.6*massif*massif;
+    return envelope*lift*ridges - TERRAIN_BASE*(1 - smoothRamp((r - LAKE_SHORE + 60)/60));
+}
+
+// the ridge line seen from the camera: how high the terrain reaches toward an azimuth, as an angle
+function ridgeAngle(azimuth)
+{
+    let ridge = 0;
+    for (let d = 300; d < 2900; d += 4)
+    {
+        const x = Math.sin(azimuth)*d, z = CAM_DIST - Math.cos(azimuth)*d;
+        ridge = Math.max(ridge, Math.atan2(terrainHeight(x, z) - EYE_Y, d));
+    }
+    return ridge;
+}
+
+// the sun sets in the lowest gap the mountains happen to have near the sunset, a sun's width wide, just clear of it
+function placeSun()
+{
+    let best = Infinity;
+    for (let a = SUN_AZIMUTH - SUN_SEARCH; a <= SUN_AZIMUTH + SUN_SEARCH; a += .01)
+    {
+        // the highest ridge under the sun's whole width, so it doesn't sit half in a narrow notch
+        const ridge = Math.max(ridgeAngle(a - SUN_RADIUS), ridgeAngle(a), ridgeAngle(a + SUN_RADIUS));
+        if (ridge < best)
+            best = ridge, sunAzimuth = a;
+    }
+    sunElevation = best + SUN_RADIUS*SUN_CLEARANCE;
+}
+
+// the terrain as one height map, lit by the low sun, its colors from forest dark low down to rock on the heights
+function buildTerrain()
+{
+    const columns = TERRAIN_SIZE.x/TERRAIN_CELL + 1|0, rows = TERRAIN_SIZE.y/TERRAIN_CELL + 1|0;
+    const centerZ = 0, heights = [], colors = [];
+    const low = rgb(.13,.08,.14), high = rgb(.38,.26,.36);
+    for (let j = 0; j < rows; ++j)
+    {
+        const z = centerZ - TERRAIN_SIZE.y/2 + j*TERRAIN_CELL, heightRow = [], colorRow = [];
+        for (let i = 0; i < columns; ++i)
+        {
+            const x = -TERRAIN_SIZE.x/2 + i*TERRAIN_CELL, h = terrainHeight(x, z);
+            heightRow.push(clamp((h + TERRAIN_BASE)/(TERRAIN_HEIGHT + TERRAIN_BASE)));
+            colorRow.push(low.lerp(high, smoothRamp(h/180)));
+        }
+        heights.push(heightRow), colors.push(colorRow);
+    }
+    const terrain = new HeightMap(heights, TERRAIN_SIZE, TERRAIN_HEIGHT + TERRAIN_BASE, colors, vec3(0, -TERRAIN_BASE, centerZ), true);
+    terrain.shader = TERRAIN_SHADER;
+    return terrain;
+}
+
+// the water's reflection is drawn from a point as far under the water as the camera is above it, and only what is
+// above the water belongs in it: a ray from that point comes up through the water's plane, and ground it passes
+// under the water before that would cover the reflection from below (with the camera up high the lake bed would turn
+// the water black), so that ground isn't drawn. But a ray that only comes up beyond the shore runs on inside the
+// hills and would find the sky; the ground stays for those, so the waves near the shore show it dark, not orange.
+// On screen the lake hides all of it
+const TERRAIN_SHADER = new Shader(`
+const float LAKE_SHORE = ${LAKE_SHORE.toFixed(1)};
+void mainImage(out vec4 c, vec2 uv)
+{
+    if (worldPos.y < 0. && worldPos.y > cameraPos.y)
+    {
+        // where the ray from the camera through here comes up through the water's plane
+        vec2 surface = mix(cameraPos.xz, worldPos.xz, cameraPos.y/(cameraPos.y - worldPos.y));
+        if (length(surface) < LAKE_SHORE) discard;
+    }
+    c = vec4(1);
+}`);
+
+// how high the near bank stands at a point, 0 or less out on the water
+const bankInner = phi => BANK_RADIUS + 3*mmNoise(phi*40) + 1.5*mmNoise(phi*150 + 7);
+function bankHeight(x, z)
+{
+    const r = Math.hypot(x, z), phi = Math.atan2(x, z);
+    return Math.min(.6, (r - bankInner(phi))*.25) + .02;
+}
+const islandEdge = a => ISLAND_RADIUS*(1 + .25*(mmNoise(a*3 + 5) - .5) + .1*(mmNoise(a*11) - .5));
+function islandHeight(x, z)
+{
+    const dx = x - ISLAND_X, dz = z - ISLAND_Z, r = Math.hypot(dx, dz), edge = islandEdge(Math.atan2(dx, dz) + PI);
+    return Math.min(.5, (edge - r)*.2) + .02;
+}
+
+// the near bank, an arc of ground in front of the camera's swing (polar round the lake center, phi from +Z), and the
+// island, both dark
+function buildBanks()
+{
+    const mesh = new Mesh, up = vec3(0, 1, 0), SIDES = 300;
+    const offsets = [0, .8, 2.4, 6, 50];
+    for (let k = 0; k < offsets.length - 1; ++k)
+    {
+        const points = [];
+        for (let i = 0; i <= SIDES; ++i)
+        {
+            const phi = (i/SIDES*2 - 1)*BANK_ARC, inner = bankInner(phi);
+            for (const r of [inner + offsets[k], inner + offsets[k+1]])
+                points.push(vec3(Math.sin(phi)*r, Math.min(.6, (r - inner)*.25) + .02, Math.cos(phi)*r));
+        }
+        mesh.addStrip(points, up, undefined, BANK_COLOR);
+    }
+    const fractions = [0, .5, .85, 1];
+    for (let k = 0; k < fractions.length - 1; ++k)
+    {
+        const points = [];
+        for (let i = 0; i <= 64; ++i)
+        {
+            const a = i/64*2*PI, edge = islandEdge(a);
+            for (const f of [fractions[k], fractions[k+1]])
+            {
+                const r = edge*f, x = ISLAND_X + Math.sin(a - PI)*r, z = ISLAND_Z + Math.cos(a - PI)*r;
+                points.push(vec3(x, Math.min(.5, (edge - r)*.2) + .02, z));
+            }
+        }
+        mesh.addStrip(points, up, undefined, BANK_COLOR);
+    }
+    mesh.doubleSided = true;
+    return mesh;
+}
+
+// the lake: a flat disc under the camera, lit and reflective; the waves are its shader's, see WATER_SHADER
+function buildLake()
+{
+    const mesh = new Mesh, up = vec3(0, 1, 0), SIDES = 96;
+    const rings = [0, 3, 6, 10, 16, 25, 40, 60, 90, 140, 220, 350, 550, 900, 1500, 2600, 4200];
+    for (let k = 0; k < rings.length - 1; ++k)
+    {
+        const points = [];
+        for (let i = 0; i <= SIDES; ++i)
+        {
+            const a = i/SIDES*2*PI;
+            for (const r of [rings[k+1], rings[k]])
+                points.push(vec3(Math.sin(a)*r, 0, Math.cos(a)*r));
+        }
+        mesh.addStrip(points, up, undefined, WHITE);
+    }
+    mesh.doubleSided = true;
+    return mesh;
+}
+
+// the water's waves: a dozen small sine waves, mostly down the wind, bending its normal so the reflection ripples
+// and the low sun's highlight breaks into a glittering path. So they don't read as a grid: their directions and
+// wavelengths are uneven, a slow noise bends their crests, and gusts drifting downwind roughen some patches and leave
+// others glassy, the long waves and the ripples in different patches. Each wave fades out where it gets smaller than
+// a pixel, so the far water calms into a mirror instead of shimmering
+const WATER_SHADER = new Shader(`
+const float WATER_WAVE_SLOPE = ${WATER_WAVE_SLOPE.toFixed(4)}, WATER_CALM_DISTANCE = ${WATER_CALM_DISTANCE.toFixed(1)};
+float waterHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
+float waterNoise(vec2 p)
+{
+    vec2 i = floor(p), f = fract(p);
+    f = f*f*(3. - 2.*f);
+    return mix(mix(waterHash(i), waterHash(i + vec2(1, 0)), f.x), mix(waterHash(i + vec2(0, 1)), waterHash(i + vec2(1)), f.x), f.y);
+}
+void mainImage(out vec4 c, vec2 uv) { c = vec4(1); }
+void mainNormal(inout vec3 n)
+{
+    vec3 toEye = worldPos - cameraPos;
+    float dist = length(toEye), footprint = length(fwidth(worldPos.xz));
+    float calm = WATER_WAVE_SLOPE*(.5 + .5*exp(-dist/WATER_CALM_DISTANCE));
+
+    // the crests bent a few meters by a slow noise
+    vec2 p = worldPos.xz, warp = p*.04 + vec2(iTime*.05, 0.);
+    p += 3.*vec2(waterNoise(warp) - .5, waterNoise(warp + 17.3) - .5);
+
+    // gusts: patches some 30m across drifting downwind, one field for the long waves, one for the ripples
+    vec2 drift = worldPos.xz*.035 - vec2(iTime*.12, 0.);
+    float gustLong = .3 + 1.4*waterNoise(drift), gustShort = .2 + 1.6*waterNoise(drift*1.7 + 41.);
+
+    vec2 slope = vec2(0);
+    for (int k = 0; k < 12; ++k)
+    {
+        float f = float(k);
+        float angle = (fract(f*.618034 + .3)*2. - 1.)*1.1;          // spread unevenly round the wind, along x
+        vec2 dir = vec2(cos(angle), sin(angle));
+        float wavelength = 10.*pow(.75, f)*(.8 + .4*fract(f*.7548)); // 10m down to about a third of a meter
+        float w = 6.2832/wavelength, speed = sqrt(9.8/w);           // deep water waves: longer ones travel faster
+        float fade = clamp(1. - footprint/wavelength*1.5, 0., 1.);
+        float gust = mix(gustLong, gustShort, f/11.);
+        slope += dir*(cos(dot(p, dir)*w + iTime*speed*w + f*2.3)*calm*.6*gust*fade);
+    }
+
+    // at a glancing angle a steep wave would turn the reflection down under the horizon, where real water would show
+    // the next wave and this one would show the sky below it, so the far water's slopes are kept shallower than that
+    float graze = max(-toEye.y/dist, 0.), steep = length(slope);
+    slope *= min(1., graze*.45/max(steep, 1e-6));
+    n = normalize(n + vec3(-slope.x, 0., -slope.y));
+}`);
+
+// the flock stays out of the water's reflection: drawn there each bird is smaller than a texel of it, and the
+// waves scramble them into glittering dark noise; the camera's still view would only show the reflection of the
+// lowest birds anyway
+class Flock extends InstancedMesh3D
+{
+    render3D()
+    {
+        if (!render3D.capturingCube)
+            super.render3D();
+    }
+}
+
+// the lake skips its own drawing while the scene is drawn into its reflection
+class Water extends EngineObject3D
+{
+    render3D()
+    {
+        if (!render3D.capturingCube)
+            super.render3D();
+    }
+}
+
+// a starling: swept wings with a little dihedral, a body and a tail, span 1 across x, nose toward -Z
+function buildBirdMesh()
+{
+    const points = [
+        vec3(0,0,-.3), vec3(0,0,.22),                     // 0 nose, 1 tail root
+        vec3(-.05,0,-.08), vec3(.05,0,-.08),               // 2, 3 shoulders
+        vec3(-.05,0,.1), vec3(.05,0,.1),                   // 4, 5 wing roots behind
+        vec3(-.5,.3,.12), vec3(.5,.3,.12),                 // 6, 7 wing tips
+        vec3(0,.05,-.02), vec3(0,-.05,-.02),               // 8, 9 back and belly
+        vec3(-.08,0,.36), vec3(.08,0,.36),                 // 10, 11 tail fan
+    ];
+    const indices = [2,4,6, 3,7,5, 0,2,3, 2,4,5, 2,5,3, 4,1,5, 0,8,1, 0,1,9, 1,10,11];
+    const mesh = new Mesh;
+    // the normal along the body, the one axis the flap never squashes to nothing
+    mesh.addTriangles(points, indices, points.map(() => vec3(0, 0, -1)), undefined, points.map(() => WHITE));
+    mesh.doubleSided = true;
+    return mesh;
+}
+
+// a cattail's parts, each a unit tall standing on the origin
+function buildReedMeshes()
+{
+    const stalk = buildCylinder(1, 1, 5, false, false);
+    stalk.transform(buildMatrix(vec3(0, .5, 0)));
+    const head = buildCapsule(1, 1, 6, 2);
+    // a leaf: a long blade arching away along +x, narrowing to its tip
+    const leaf = new Mesh, points = [];
+    for (let k = 0; k <= 6; ++k)
+    {
+        const t = k/6, w = .025*(1 - t*.9);
+        points.push(vec3(.35*t*t, t, w), vec3(.35*t*t, t, -w));
+    }
+    leaf.addStrip(points, vec3(0, 0, 1), undefined, WHITE);
+    leaf.doubleSided = true;
+    stalk.doubleSided = true;
+    return {stalk, head, leaf};
+}
+
+// the cattails' fixed parts: where each stands, its height and its leaves' turn; the sway is added each frame
+const leafTurn = new Float32Array(REED_COUNT*2), leafLength = new Float32Array(REED_COUNT*2);
+function placeReeds()
+{
+    for (let i = 0; i < REED_COUNT; ++i)
+    {
+        let x, z, y, h, w;
+        const island = i >= NEAR_REEDS;
+        if (!island)
+        {
+            // in front of the camera's swing, thicker by the water's edge
+            const phi = (mmHash(i*3.1) - .5)*2*(BANK_ARC - .19), inner = bankInner(phi);
+            const r = inner + .3 + 5*mmHash(i*5.7)**1.6;
+            x = Math.sin(phi)*r, z = Math.cos(phi)*r;
+            y = bankHeight(x, z) - .05;
+            h = .9 + 1.9*mmHash(i*7.7)**1.6;
+            w = .022;
+        }
+        else
+        {
+            // the island's reeds are taller and drawn thicker so they read 200m away
+            const a = mmHash(i*2.3)*2*PI, r = islandEdge(a)*Math.sqrt(mmHash(i*4.9))*.92;
+            x = ISLAND_X + Math.sin(a - PI)*r, z = ISLAND_Z + Math.cos(a - PI)*r;
+            y = islandHeight(x, z) - .05;
+            h = 2.2 + 2*mmHash(i*7.7);
+            w = .08;
+        }
+        reedX[i] = x, reedY[i] = y, reedZ[i] = z, reedH[i] = h, reedW[i] = w;
+        reedLean[i] = (mmHash(i*1.9) - .5)*.6;
+        reedPhase[i] = mmHash(i*5.3)*6;
+        reedHead[i] = h > 2 && mmHash(i*8.3) < .7 ? 1 : 0;
+        for (let j = 0; j < 2; ++j)
+        {
+            leafTurn[i*2+j] = mmHash(i*9.1 + j*3.3)*2*PI;
+            leafLength[i*2+j] = h*(.45 + .4*mmHash(i*6.1 + j*1.7));
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    new Render3DPlugin;
+    postProcessBloom(.85, .7, 8);
+    placeSun();
+    render3D.sky = buildDuskSky();
+    render3D.setFog(FOG_START, FOG_END, FOG_COLOR);
+    render3D.camera.fov = CAM_FOV;
+    render3D.camera.far = 5000;
+    // the low sun lights the water, its highlight is the glitter on the waves
+    render3D.sunDirection = vec3(Math.sin(sunAzimuth)*Math.cos(sunElevation), Math.sin(sunElevation), -Math.cos(sunAzimuth)*Math.cos(sunElevation));
+    render3D.sunColor = rgb(1,.78,.55);
+    render3D.ambientColor = rgb(.5,.36,.48);
+    render3D.ambientGroundColor = rgb(.12,.07,.12);
+
+    // the scenery wears baked colors and lights itself
+    const scenery = (mesh, color=WHITE) =>
+    {
+        const o = new EngineObject3D(vec3(), mesh, undefined, color);
+        o.emissive = 1;
+        return o;
+    };
+    buildTerrain();
+    scenery(buildBanks());
+
+    // the lake reflects the scene drawn from the camera's mirror image under the water, which is an exact
+    // reflection for flat water; the waves bend the normals it is looked up by
+    lake = new Water(vec3(), buildLake(), undefined, WATER_COLOR);
+    lake.shader = WATER_SHADER;
+    lake.reflectivity = WATER_REFLECTIVITY;
+    lake.roughness = 0; // a mirror: its reflection sharp, the waves alone break it up
+    lake.specular = WATER_SPECULAR;
+    lake.environment = waterReflection = new CubeMap(WATER_REFLECTION_SIZE);
+
+    placeReeds();
+    const reed = buildReedMeshes();
+    const reedSet = (mesh, count) => { const s = new InstancedMesh3D(mesh, count, undefined, REED_COLOR); s.emissive = 1; s.radius = 1e4; return s; };
+    stalkSet = reedSet(reed.stalk, REED_COUNT), headSet = reedSet(reed.head, REED_COUNT), leafSet = reedSet(reed.leaf, REED_COUNT*2);
+
+    birdMesh = buildBirdMesh();
+    birdSet = new Flock(birdMesh, MAX_BIRDS, undefined, birdNear);
+    birdSet.emissive = 1, birdSet.radius = 1e4;
+    hawkObject = scenery(birdMesh, rgb(.02,.01,.03));
+
+    // ?birds=N starts with N birds
+    const birdsParam = +new URLSearchParams(location.search).get('birds');
+    if (birdsParam) birdCount = clamp(birdsParam, 1000, MAX_BIRDS);
+    if (location.search.includes('title')) titleStart = time; // ?title shows the title card at load
+    if (cinematic) titleStart = .5, hudVisible = false;
+    startFlock();
+    updateCamera();
+    window.murmuration = {simHawk, flockCenter, simStep, get birdCount() { return birdCount; }};
+}
+
+// the flock leaves for the night: it streams away across the lake and on over the mountains into the distance
+function startDeparture()
+{
+    if (simDepart.active) return;
+    const x = Math.sin(DEPART_AZIMUTH)*DEPART_DISTANCE, z = -Math.cos(DEPART_AZIMUTH)*DEPART_DISTANCE;
+    // its height: just over the ridge line seen from the camera, which is the highest the terrain reaches toward it
+    const away = Math.hypot(x, z - CAM_DIST), azimuth = Math.atan2(x, CAM_DIST - z);
+    const y = EYE_Y + Math.tan(ridgeAngle(azimuth) + DEPART_ABOVE)*away;
+    Object.assign(simDepart, {active: true, age: 0, x, y, z, descend: DEPART_DESCEND});
+}
+
+// the flock comes back the way it went, over the middle range, and gathers into a murmuration again
+let goneTime = 0;
+function returnFlock()
+{
+    const x = simDepart.x*.45, z = simDepart.z*.45, l = Math.hypot(x, z), y = simDepart.y*.5;
+    for (let i = 0; i < birdCount; ++i)
+    {
+        bgone[i] = bleave[i] = 0;
+        const side = (Math.random() - .5)*DEPART_SPREAD, back = Math.random()*120;
+        bpx[i] = x - z/l*side + x/l*back;
+        bpy[i] = y + Math.random()*15;
+        bpz[i] = z + x/l*side + z/l*back;
+        // home as fast as that far out allows (see FAR_SPEEDUP), gliding down on the way to arrive at the flock's height
+        const speed = SPEED_MAX + (l - FAR_RADIUS)*FAR_SPEEDUP*(.9 + Math.random()*.1);
+        bvx[i] = -x/l*speed, bvy[i] = -(bpy[i] - 30)/l*speed, bvz[i] = -z/l*speed;
+        bpanic[i] = bcool[i] = 0;
+    }
+    simDepart.active = false;
+    goneTime = 0;
+}
+
+// spawn and fly the flock for a few seconds first, so it opens mid murmuration instead of in its spawn shape
+function startFlock()
+{
+    spawnFlock(flockSeed);
+    for (let k = 0; k < 180; ++k)
+        simStep(1/60);
+}
+
+function updateCamera()
+{
+    const camera = render3D.camera;
+    if (freeCam)
+    {
+        const {yaw, pitch} = freeLook;
+        camYaw = yaw;
+        camera.pos = freeCamPos.copy();
+        camera.lookAt(freeCamPos.add(vec3(-Math.sin(yaw)*Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw)*Math.cos(pitch))));
+        return;
+    }
+    camYaw = 0;
+    camera.pos = vec3(0, EYE_Y, CAM_DIST);
+    camera.lookAt(vec3(0, EYE_Y + 100*Math.tan(CAM_PITCH), CAM_DIST - 100));
+}
+
+// free cam: drag to look, WASD or the arrows to move along the view, Q/E down and up, Shift faster
+function updateFreeCam()
+{
+    if (mouseIsDown(0))
+    {
+        freeLook.yaw -= mouseDeltaScreen.x*FREE_CAM_TURN;
+        freeLook.pitch = clamp(freeLook.pitch - mouseDeltaScreen.y*FREE_CAM_TURN, -1.4, 1.4);
+    }
+    const {yaw, pitch} = freeLook, move = keyDirection();
+    const speed = (keyIsDown('ShiftLeft') || keyIsDown('ShiftRight') ? FREE_CAM_FAST : FREE_CAM_SPEED)/60;
+    const forward = vec3(-Math.sin(yaw)*Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw)*Math.cos(pitch));
+    const right = vec3(Math.cos(yaw), 0, -Math.sin(yaw));
+    const climb = (keyIsDown('KeyE') ? 1 : 0) - (keyIsDown('KeyQ') ? 1 : 0);
+    const step = forward.scale(move.y).add(right.scale(move.x)).add(vec3(0, climb, 0)).scale(speed);
+    freeCamPos.set(freeCamPos.x + step.x, Math.max(.5, freeCamPos.y + step.y), freeCamPos.z + step.z);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameUpdate()
+{
+    // first input unlocks audio
+    if (!soundStarted && (mouseWasPressed(0) || keyWasPressed('Space')))
+    {
+        soundStarted = true;
+        windSound.play(undefined, .5, 1, 0, true);
+    }
+
+    if (keyWasPressed('KeyH')) hudVisible = !hudVisible;
+    if (keyWasPressed('KeyT')) titleStart = time;
+    if (keyWasPressed('KeyF'))
+    {
+        // into free cam where the camera is, or back to the still shot
+        freeCam = !freeCam;
+        const camera = render3D.camera;
+        freeCamPos.set(camera.pos.x, camera.pos.y, camera.pos.z);
+        Object.assign(freeLook, {yaw: camYaw, pitch: CAM_PITCH});
+    }
+    if (keyWasPressed('KeyA') && !freeCam) autoHawk = !autoHawk;
+    if (keyWasPressed('Space')) slowMo = !slowMo;
+    if (keyWasPressed('KeyR')) { ++flockSeed; startFlock(); }
+    if (keyWasPressed('KeyG') || cinematic && time >= CINE_DEPART && !simDepart.active) startDeparture();
+
+    // outside the cinematic, a flock that has flown away comes back a few seconds later
+    if (!cinematic && simDepart.active && flockCenter.flying < birdCount*.01 && (goneTime += 1/60) > 4) returnFlock();
+    if (mouseWheel) birdCount = clamp(birdCount - Math.sign(mouseWheel)*2000, 2000, MAX_BIRDS);
+
+    // in free cam the mouse looks round, the hawk flies its passes on its own
+    if (freeCam)
+        updateFreeCam(), lastMouseMove = -1e9;
+    else if (mouseDeltaScreen.lengthSquared() > 0 || mouseWasPressed(0))
+        lastMouseMove = simTime;
+    updateCamera();
+    const dt = slowMo ? 1/240 : 1/60;
+
+    updateHawk(dt);
+    const start = performance.now();
+    simStep(dt);
+    timing('sim', start);
+}
+
+// how long each part of a frame takes, smoothed, in ms; tools/capture.mjs can print it with MURM_EVAL=frameTimings
+const frameTimings = {};
+function timing(name, start)
+{
+    frameTimings[name] = +lerp(frameTimings[name] || 0, performance.now() - start, .05).toFixed(3);
+}
+
+// the hawk follows the mouse, or flies dive passes through the flock when the mouse is idle
+function updateHawk(dt)
+{
+    const h = simHawk, camera = render3D.camera;
+    hawkFlap.t += dt;
+    const mouseActive = simTime - lastMouseMove < 4;
+    const forward = vec3(-Math.sin(camYaw), 0, -Math.cos(camYaw)), right = vec3(Math.cos(camYaw), 0, -Math.sin(camYaw));
+    const center = vec3(flockCenter.x, flockCenter.y, flockCenter.z);
+    const centerDepth = Math.max(20, center.subtract(camera.pos).dot(forward));
+    let target;
+    h.active = hawkVisible = false;
+    if (mouseActive)
+    {
+        // where the mouse's ray crosses the upright plane through the flock facing the camera
+        const ray = render3D.screenToRay(mousePosScreen);
+        const along = ray.direction.dot(forward);
+        target = ray.origin.add(ray.direction.scale(centerDepth/Math.max(along, .05)));
+        h.active = hawkVisible = true;
+        if (mouseWasPressed(0))
+        {
+            h.burst = 1;
+            whooshSound.play();
+        }
+    }
+    else if (autoHawk)
+    {
+        // the strike nearest now: the cinematic flies its own, otherwise one every 9 seconds
+        let k, strike, angle, now;
+        if (cinematic)
+        {
+            now = time, k = 0;
+            const strikeTime = j => CINE_PASSES[j].time + HAWK_PASS_REACH;
+            for (let j = 1; j < CINE_PASSES.length; ++j)
+                if (Math.abs(now - strikeTime(j)) < Math.abs(now - strikeTime(k))) k = j;
+            strike = CINE_PASSES[k].time + HAWK_PASS_REACH, angle = CINE_PASSES[k].angle;
+        }
+        else
+        {
+            now = simTime, k = Math.round((now - HAWK_PASS_REACH)/9);
+            strike = k*9 + HAWK_PASS_REACH, angle = mmHash(k + 17)*Math.PI*2;
+        }
+        const t = now - strike, at = Math.abs(t);
+        if (at < HAWK_PASS_HALF)
+        {
+            // the 2D version's path in screen units, scaled out to the flock's distance, stretched past the
+            // frame's edges by speeding up away from the strike
+            const scale = centerDepth/FOCAL;
+            const along = Math.sign(t)*(at*HAWK_PASS_SPEED + Math.max(0, at - .5)**2*HAWK_PASS_ACCEL);
+            const p = clamp(t/(2*HAWK_PASS_REACH) + .5);
+            const bow = Math.sin(p*Math.PI)*4*(mmHash(k + 3) - .5);
+            const sideways = (Math.cos(angle)*along - Math.sin(angle)*bow)*scale;
+            const upward = (Math.sin(angle)*along*.5 + Math.cos(angle)*bow + along*along*HAWK_SWOOP)*scale;
+            target = center.add(right.scale(sideways)).add(vec3(0, upward, 0));
+            hawkVisible = true;
+            h.active = at < HAWK_PASS_REACH;
+            if (t >= 0 && t - dt < 0)
+            {
+                h.burst = .6;
+                if (soundStarted) whooshSound.play(undefined, .6);
+            }
+        }
+    }
+
+    if (hawkVisible)
+    {
+        // it turns to face the way it moves across the screen (in pixels: sliding along the mouse's ray as the flock
+        // comes nearer moves it in the world but not on screen)
+        const from = render3D.worldToScreen(hawkPos), to = render3D.worldToScreen(target);
+        if (from && to)
+        {
+            const sx = to.x - from.x, sy = from.y - to.y, l = Math.hypot(sx, sy);
+            if (l > .5)
+            {
+                const before = Math.atan2(hawkDir.y, hawkDir.x);
+                hawkDir.set(lerp(hawkDir.x, sx/l, .15), lerp(hawkDir.y, sy/l, .15));
+                const n = hawkDir.length() || 1;
+                hawkDir.set(hawkDir.x/n, hawkDir.y/n);
+                const turn = azimuthDelta(Math.atan2(hawkDir.y, hawkDir.x), before);
+                hawkBank = lerp(hawkBank, clamp(turn*25, -.8, .8), .1);
+            }
+        }
+        hawkPos.set(target.x, target.y, target.z);
+    }
+    h.hx = hawkPos.x, h.hy = hawkPos.y, h.hz = hawkPos.z;
+    h.ex = camera.pos.x, h.ey = camera.pos.y, h.ez = camera.pos.z;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// each frame: the birds, the reeds' sway, the hawk and the lake under the camera
+function gameUpdatePost()
+{
+    let start = performance.now();
+    updateBirds();
+    timing('birds', start);
+    start = performance.now();
+    updateReeds();
+    timing('reeds', start);
+
+    // the hawk's nose points the way it flies across the screen, drifting a little toward and away from the camera;
+    // its back is turned up and away, so the camera below sees its belly and spread wings in perspective, and it
+    // banks into its turns; its span breathes with the wingbeat
+    const span = hawkVisible ? HAWK_SPAN : 0, beat = Math.sin(hawkFlap.t*9);
+    const cameraRight = render3D.cameraRight, cameraUp = render3D.cameraUp, cameraBack = render3D.cameraBack;
+    if (cameraRight)
+    {
+        const f = cameraRight.scale(hawkDir.x).add(cameraUp.scale(hawkDir.y))
+            .add(cameraBack.scale(-.35*Math.sin(hawkFlap.t*.5))).normalize();
+        const tilt = vec3(0, .8, 0).subtract(cameraBack.scale(.6));
+        const level = tilt.subtract(f.scale(tilt.dot(f))).normalize();
+        // banked: turned round its own length
+        const bank = hawkBank + .15*Math.sin(hawkFlap.t*1.3), c = Math.cos(bank), s = Math.sin(bank);
+        const facing = level.scale(c).add(f.cross(level).scale(s));          // its back
+        const along = f.scale(-1), across = facing.cross(along);                // its tail and its right wing
+        const sx = span*(.8 + .2*beat), sy = span*beat, sz = span;
+        hawkObject.localMatrix = new Matrix4([across.x*sx, across.y*sx, across.z*sx, 0, facing.x*sy, facing.y*sy, facing.z*sy, 0,
+            along.x*sz, along.y*sz, along.z*sz, 0, hawkPos.x, hawkPos.y, hawkPos.z, 1]);
+    }
+    // the water's reflection, drawn from the camera's mirror image under it
+    const camera = render3D.camera.pos;
+    lake.pos3D = vec3(camera.x, 0, camera.z);
+    if (frame % WATER_REFLECTION_EVERY == 0)
+        waterReflection.capture(vec3(camera.x, -camera.y, camera.z));
+}
+
+// every bird's matrix straight from its velocity: wings across it, the flap as its height
+const FLAP_STEPS = 256, flapTable = new Float32Array(FLAP_STEPS);
+for (let k = 0; k < FLAP_STEPS; ++k) flapTable[k] = Math.cos(k/FLAP_STEPS*2*PI);
+function updateBirds()
+{
+    const m = birdSet.matrixData, camera = render3D.camera.pos;
+    const camX = camera.x, camZ = camera.z, n = birdCount;
+    const flapTime = simTime*BIRD_FLAP_RATE, toStep = FLAP_STEPS/(2*PI);
+    for (let i = 0; i < n; ++i)
+    {
+        const k = i*16;
+        if (bgone[i])
+        {
+            m[k] = m[k+2] = m[k+4] = m[k+5] = m[k+6] = m[k+8] = m[k+9] = m[k+10] = 0;
+            continue;
+        }
+        let fx = bvx[i], fy = bvy[i], fz = bvz[i];
+        const fl = 1/Math.sqrt(fx*fx + fy*fy + fz*fz + 1e-9);
+        fx *= fl, fy *= fl, fz *= fl;
+        // right is level, up is right cross forward
+        let rx = -fz, rz = fx;
+        const rl = 1/Math.sqrt(rx*rx + rz*rz + 1e-9);
+        rx *= rl, rz *= rl;
+        const ux = -rz*fy, uy = rz*fx - rx*fz, uz = rx*fy;
+        const s = bsize[i]*BIRD_SCALE, flap = flapTable[((bphase[i] + flapTime)*toStep|0) & (FLAP_STEPS - 1)]*s;
+        const px = bpx[i], py = bpy[i], pz = bpz[i];
+        m[k]   = rx*s;    m[k+1] = 0;       m[k+2]  = rz*s;
+        m[k+4] = ux*flap; m[k+5] = uy*flap; m[k+6]  = uz*flap;
+        m[k+8] = -fx*s;   m[k+9] = -fy*s;   m[k+10] = -fz*s;
+        m[k+12] = px;     m[k+13] = py;     m[k+14] = pz;
+    }
+    birdSet.count = n;
+    birdSet.markDirtyRange(0, n);
+
+    // the haze: near birds nearly black, far ones fade toward the dusk, and a leaving flock on into the hills' haze;
+    // a quarter of the flock a frame
+    const colors = birdSet.colorData, camY = camera.y;
+    const quarter = Math.ceil(n/4), start = birdColorCursor*quarter % n, end = Math.min(n, start + quarter);
+    birdColorCursor = (birdColorCursor + 1) % 4;
+    const nr = birdNear.r, ng = birdNear.g, nb = birdNear.b, dr = birdFar.r - nr, dg = birdFar.g - ng, db = birdFar.b - nb;
+    for (let i = start; i < end; ++i)
+    {
+        const dx = bpx[i] - camX, dy = bpy[i] - camY, dz = bpz[i] - camZ;
+        const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        let t = (d - 100)/120;
+        t = t < 0 ? 0 : t > 1 ? 1 : t*t;
+        let r = nr + dr*t, g = ng + dg*t, b = nb + db*t;
+        if (d > 220)
+        {
+            // never all the way, so a flock leaving over the mountains stays a dark ribbon until the fog takes it
+            const u = Math.min(.6, (d - 220)/1500);
+            r += (birdHaze.r - r)*u, g += (birdHaze.g - g)*u, b += (birdHaze.b - b)*u;
+        }
+        const k = i*8;
+        colors[k] = r, colors[k+1] = g, colors[k+2] = b;
+    }
+    birdSet.colorDirtyStart = Math.min(birdSet.colorDirtyStart, start);
+    birdSet.colorDirtyEnd = Math.max(birdSet.colorDirtyEnd, end);
+}
+
+// the cattails lean with the wind, a shear so a tall one's top travels further
+function updateReeds()
+{
+    const t = simTime, stalks = stalkSet.matrixData, heads = headSet.matrixData, leaves = leafSet.matrixData;
+    let headCount = 0;
+    for (let i = 0; i < REED_COUNT; ++i)
+    {
+        const x = reedX[i], y = reedY[i], z = reedZ[i], h = reedH[i], w = reedW[i];
+        const lean = (Math.sin(t*1.1 + x*.12 + reedPhase[i]*.2)*.5 + Math.sin(t*2.6 + reedPhase[i])*.12 + reedLean[i])*.15;
+        const leanZ = lean*.3;
+
+        let k = i*16;
+        stalks[k] = w;          stalks[k+1] = 0; stalks[k+2] = 0;
+        stalks[k+4] = lean*h;   stalks[k+5] = h; stalks[k+6] = leanZ*h;
+        stalks[k+8] = 0;        stalks[k+9] = 0; stalks[k+10] = w;
+        stalks[k+12] = x;       stalks[k+13] = y; stalks[k+14] = z;
+
+        // the head, a fat brown cigar near the top, a short bare spike above it
+        if (reedHead[i])
+        {
+            const hw = w*REED_HEAD_WIDTH, hl = h*REED_HEAD_LENGTH, up = h*REED_HEAD_HEIGHT;
+            k = headCount++*16;
+            heads[k] = hw;           heads[k+1] = 0;  heads[k+2] = 0;
+            heads[k+4] = lean*hl;    heads[k+5] = hl; heads[k+6] = leanZ*hl;
+            heads[k+8] = 0;          heads[k+9] = 0;  heads[k+10] = hw;
+            heads[k+12] = x + lean*up; heads[k+13] = y + up; heads[k+14] = z + leanZ*up;
+        }
+
+        for (let j = 0; j < 2; ++j)
+        {
+            const turn = leafTurn[i*2+j], l = leafLength[i*2+j], c = Math.cos(turn)*l, s = Math.sin(turn)*l;
+            k = (i*2 + j)*16;
+            leaves[k] = c;          leaves[k+1] = 0;  leaves[k+2] = -s;
+            leaves[k+4] = lean*l*.8; leaves[k+5] = l; leaves[k+6] = leanZ*l*.8;
+            leaves[k+8] = s*w*40;   leaves[k+9] = 0;  leaves[k+10] = c*w*40;
+            leaves[k+12] = x;       leaves[k+13] = y; leaves[k+14] = z;
+        }
+    }
+    stalkSet.markDirtyRange(0, REED_COUNT);
+    headSet.count = headCount;
+    headCount && headSet.markDirtyRange(0, headCount);
+    leafSet.markDirtyRange(0, REED_COUNT*2);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender() {}
+
+function gameRenderPost()
+{
+    const now = performance.now();
+    if (lastFrameTime)
+        fpsSmooth = lerp(fpsSmooth, 1e3/Math.max(now - lastFrameTime, 1), .05);
+    lastFrameTime = now;
+
+    // title card on T: fades in over a second, holds three, fades out over two
+    const titleAge = time - titleStart;
+    if (titleAge < 6)
+        drawCard(Math.min(titleAge, 1, (6 - titleAge)/2), 'Murmuration', `${birdCount.toLocaleString()} starlings in LittleJS`);
+
+    // the cinematic's end card fades in and holds to the last frame
+    if (cinematic && time > CINE_END_CARD)
+        drawCard(Math.min(time - CINE_END_CARD, 1), 'LittleJS', 'The tiny fast JavaScript game engine');
+
+    if (!hudVisible) return;
+    const size = Math.round(mainCanvasSize.y/40), y = mainCanvasSize.y - size*1.4;
+    if (freeCam)
+        drawTextScreen('free cam:  WASD move   drag to look   Q/E down/up   Shift faster   F back', vec2(size, size*1.4),
+            size*.8, rgb(1,1,1,.75), 0, BLACK, 'left');
+    const text = `${birdCount.toLocaleString()} starlings` + (recordMode ? '' : `   ${Math.round(fpsSmooth)} fps`);
+    drawTextScreen(text, vec2(size, y), size, rgb(1,1,1,.75), 0, BLACK, 'left');
+    drawTextScreen('LittleJS', vec2(mainCanvasSize.x - size, y), size, rgb(1,1,1,.75), 0, BLACK, 'right');
+}
+
+// big italic line with a smaller line under it, high in the sky
+function drawCard(alpha, line1, line2)
+{
+    const size = mainCanvasSize.y/9, x = mainCanvasSize.x/2, y = mainCanvasSize.y*.2;
+    const outline = rgb(.1,.05,.12,alpha*.35);
+    drawTextScreen(line1, vec2(x, y), size, rgb(1,.95,.9,alpha*.9), size*.04, outline, 'center', 'Georgia, serif', 'italic');
+    drawTextScreen(line2, vec2(x, y + size*.85), size*.3, rgb(1,.92,.85,alpha*.8), size*.02, outline, 'center', 'Georgia, serif');
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ?record: the engine only steps when told to, so tools/capture.mjs can record frame exact video
+const recordMode = location.search.includes('record');
+let recordReady = false;
+setEngineManualStep(recordMode);
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost).then(() => recordReady = true);
+</script>
