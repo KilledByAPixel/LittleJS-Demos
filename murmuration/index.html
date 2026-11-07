@@ -14,7 +14,8 @@
 // Birds steer by a coarse 3D grid instead of searching neighbors: each frame
 // every cell sums its birds' count, velocity, position and panic, and a bird
 // reads its own cell plus the six it touches. Alignment and cohesion come from
-// those averages, separation from the density gradient. O(N), so tens of
+// those averages, separation from the density gradient, and even spacing from
+// a finer density grid read with smooth interpolation. O(N), so tens of
 // thousands of birds run at 60fps.
 
 const MAX_BIRDS = 60000;
@@ -41,6 +42,33 @@ const gridPX = new Float32Array(GN), gridPY = new Float32Array(GN), gridPZ = new
 
 // steering weights
 const K_ALIGN = 1.4, K_COHESION = .7, K_SEPARATE = .18, K_WANDER = 1;
+// against clumping: K_PRESSURE pushes by the gradient of count squared, and cohesion turns outward past DENSE_COUNT birds a cell
+const K_PRESSURE = .002, DENSE_COUNT = 150;
+
+// spacing: a finer density grid each bird counts into and reads back with trilinear weights, so every bird is
+// pushed smoothly down its own local density slope and the birds even out inside the coarse cells too.
+// SPREAD_MAX caps that push, so a bird at the flock's thin edge is eased out, never flung away
+const FCELL = 1.5, FGX = Math.ceil((GX+1)*CELL/FCELL) + 3, FGY = Math.ceil((GY+1)*CELL/FCELL) + 3, FGZ = Math.ceil((GZ+1)*CELL/FCELL) + 3;
+const FGXY = FGX*FGY, fineDensity = new Uint16Array(FGXY*FGZ);
+const K_SPREAD = 15, SPREAD_MAX = 8;
+// both grids shift by a random part of a cell every frame: a fixed grid's cell walls are where its forces jump,
+// and birds, flying mostly level, would line up along them in flat horizontal layers
+
+// density waves: in a real murmuration bands of tighter packed birds roll slowly through the flock, so its darkness
+// shimmers. Three slow plane waves, each turning on its own, nudge birds toward their moving crests; the spacing
+// above keeps that a gentle squeeze, so the dense bands keep traveling instead of setting into clumps
+const WAVES = [
+    {length:38, speed:5,   turn: .021, angle:0,   tilt: .25, swell:.23},
+    {length:52, speed:6.5, turn:-.016, angle:2.2, tilt:-.2,  swell:.17},
+    {length:30, speed:4,   turn: .027, angle:4.1, tilt: .35, swell:.29},
+];
+const K_WAVE = 8;       // m/s/s, the push toward the crests, on average
+const WAVE_SWELL = .6;  // each wave's strength swells and fades by this much, every half minute or so
+const WAVE_DEPTH = .8;  // how much the crests relax the spacing and the troughs stiffen it
+const WAVE_COUNT = WAVES.length, waveData = new Float64Array(WAVE_COUNT*8);
+// a sine table for the waves, read for every cell of the flock every frame; cosine is a quarter turn on
+const WAVE_STEPS = 4096, WAVE_TO_STEP = WAVE_STEPS/(2*Math.PI), waveSine = new Float32Array(WAVE_STEPS);
+for (let k = 0; k < WAVE_STEPS; ++k) waveSine[k] = Math.sin(k/WAVE_TO_STEP);
 const K_ATTRACT = 26, ATTRACT_RADIUS = 8;
 
 // a slowly changing ABC flow, divergence free so it stretches and folds the flock
@@ -63,7 +91,7 @@ const PANIC_DECAY = .94, PANIC_THRESHOLD = .12, PANIC_CATCH = .1, PANIC_REFRACTO
 
 // per cell steering cache, filled the first time a frame touches a cell
 const cellAX = new Float32Array(GN), cellAY = new Float32Array(GN), cellAZ = new Float32Array(GN);
-const cellPanic = new Float32Array(GN), cellFrame = new Int32Array(GN);
+const cellPanic = new Float32Array(GN), cellCohesion = new Float32Array(GN), cellSpread = new Float32Array(GN), cellFrame = new Int32Array(GN);
 
 let simTime = 0, simFrame = 0, simSeed = 1;
 // fast xorshift random 0..1, the sim calls it about four times per bird per frame
@@ -119,6 +147,10 @@ function simStep(dt)
     gridCount.fill(0); gridPanic.fill(0);
     gridVX.fill(0); gridVY.fill(0); gridVZ.fill(0);
     gridPX.fill(0); gridPY.fill(0); gridPZ.fill(0);
+    fineDensity.fill(0);
+    // this frame's grid origins, shifted at random, see FCELL
+    const cox = GOX - simRandom()*CELL, coy = GOY - simRandom()*CELL, coz = GOZ - simRandom()*CELL;
+    const fox = GOX - CELL - simRandom()*FCELL, foy = GOY - CELL - simRandom()*FCELL, foz = GOZ - CELL - simRandom()*FCELL;
     let cx = 0, cy = 0, cz = 0, flying = 0;
     for (let i = 0; i < n; ++i)
     {
@@ -128,7 +160,7 @@ function simStep(dt)
         cx += bpx[i]; cy += bpy[i]; cz += bpz[i];
 
         // a bird well outside the grid (leaving, or coming back from far away) doesn't flock
-        let ix = Math.floor((bpx[i] - GOX)/CELL), iy = Math.floor((bpy[i] - GOY)/CELL), iz = Math.floor((bpz[i] - GOZ)/CELL);
+        let ix = Math.floor((bpx[i] - cox)/CELL), iy = Math.floor((bpy[i] - coy)/CELL), iz = Math.floor((bpz[i] - coz)/CELL);
         if (ix < 0 || ix >= GX || iy < 0 || iy >= GY || iz < 0 || iz >= GZ)
         {
             bcell[i] = -1;
@@ -143,6 +175,11 @@ function simStep(dt)
         gridVX[c] += bvx[i]; gridVY[c] += bvy[i]; gridVZ[c] += bvz[i];
         gridPX[c] += bpx[i]; gridPY[c] += bpy[i]; gridPZ[c] += bpz[i];
         gridPanic[c] += bpanic[i];
+
+        // counted at its nearest fine grid node, the reads below interpolate between nodes so the push stays smooth
+        const jx = Math.min((bpx[i] - fox)/FCELL + .5|0, FGX-1), jy = Math.min((bpy[i] - foy)/FCELL + .5|0, FGY-1);
+        const jz = Math.min((bpz[i] - foz)/FCELL + .5|0, FGZ-1);
+        ++fineDensity[jx + jy*FGX + jz*FGXY];
     }
     flockCenter.flying = flying;
     if (flying)
@@ -189,6 +226,16 @@ function simStep(dt)
         for (const a of [a0, a1])
             a.x += (simDepart.gateX - a.x)*u, a.y += (simDepart.gateY - a.y)*u, a.z += (simDepart.gateZ - a.z)*u;
     }
+    // this frame's density waves: each one's direction, wave vector and how far it has traveled, measured from the
+    // flock's middle so the bands drift through the flock at their own slow speed instead of the flock flying through them
+    // packed flat, eight numbers a wave: direction, wave vector, phase, and its relative strength as it swells and fades
+    for (let k = 0; k < WAVES.length; ++k)
+    {
+        const w = WAVES[k], a = w.angle + simTime*w.turn, l = Math.hypot(1, w.tilt), n = 2*Math.PI/w.length;
+        const dx = Math.cos(a)/l, dy = w.tilt/l, dz = Math.sin(a)/l;
+        const strength = 1 + WAVE_SWELL*Math.sin(simTime*w.swell + k*2.4);
+        waveData.set([dx, dy, dz, dx*n, dy*n, dz*n, n*w.speed*simTime + dx*n*flockCenter.x + dy*n*flockCenter.y + dz*n*flockCenter.z, strength], k*8);
+    }
     const flowPhaseX = simTime*FLOW_DRIFT, flowPhaseY = simTime*FLOW_DRIFT*.7 + 1, flowPhaseZ = simTime*FLOW_DRIFT*1.3 + 2;
     const h = simHawk;
     h.burst = Math.max(0, h.burst - dt*1.2);
@@ -227,19 +274,55 @@ function simStep(dt)
             const uy = .5*(Math.sin(fx) + Math.cos(fz));
             const uz = .7*Math.sin(fy) + Math.cos(fx);
 
-            // alignment, cohesion, separation from the density gradient, flow, less what depends on the bird
-            cellAX[c] = avx*K_ALIGN + apx*K_COHESION - (gridCount[c1] - gridCount[c0])*K_SEPARATE + ux*FLOW_SPEED*K_FLOW;
-            cellAY[c] = avy*K_ALIGN + apy*K_COHESION - (gridCount[c3] - gridCount[c2])*K_SEPARATE + uy*FLOW_SPEED*.6*K_FLOW;
-            cellAZ[c] = avz*K_ALIGN + apz*K_COHESION - (gridCount[c5] - gridCount[c4])*K_SEPARATE + uz*FLOW_SPEED*K_FLOW;
+            // cohesion fades out as the neighborhood fills up and turns into a push outward past DENSE_COUNT
+            // birds a cell, so crowded spots spread out instead of packing tighter
+            const coh = cellCohesion[c] = K_COHESION*Math.max(-1, 1 - 1/(inv*7*DENSE_COUNT));
+
+            // alignment, cohesion, separation from the pressure gradient, flow, less what depends on the bird;
+            // pressure grows with the square of the count so dense spots push much harder than sparse ones
+            const p0 = gridCount[c0]*gridCount[c0], p1 = gridCount[c1]*gridCount[c1], p2 = gridCount[c2]*gridCount[c2];
+            const p3 = gridCount[c3]*gridCount[c3], p4 = gridCount[c4]*gridCount[c4], p5 = gridCount[c5]*gridCount[c5];
+            // up the density waves' slope at the cell, toward the nearest crest, and how high the waves stand here,
+            // -1 trough to 1 crest: crests relax the spacing so birds pack tighter
+            let wx = 0, wy = 0, wz = 0, crest = 0;
+            for (let k = 0; k < WAVE_COUNT*8; k += 8)
+            {
+                const step = (apx*waveData[k+3] + apy*waveData[k+4] + apz*waveData[k+5] - waveData[k+6])*WAVE_TO_STEP|0;
+                const g = waveSine[(step + WAVE_STEPS/4) & (WAVE_STEPS-1)]*waveData[k+7]*K_WAVE;
+                wx += waveData[k]*g; wy += waveData[k+1]*g; wz += waveData[k+2]*g;
+                crest += waveSine[step & (WAVE_STEPS-1)]*waveData[k+7];
+            }
+            cellSpread[c] = K_SPREAD*Math.max(.1, 1 - WAVE_DEPTH*crest/WAVE_COUNT);
+
+            cellAX[c] = avx*K_ALIGN + apx*coh - (gridCount[c1] - gridCount[c0])*K_SEPARATE - (p1 - p0)*K_PRESSURE + ux*FLOW_SPEED*K_FLOW + wx;
+            cellAY[c] = avy*K_ALIGN + apy*coh - (gridCount[c3] - gridCount[c2])*K_SEPARATE - (p3 - p2)*K_PRESSURE + uy*FLOW_SPEED*.6*K_FLOW + wy;
+            cellAZ[c] = avz*K_ALIGN + apz*coh - (gridCount[c5] - gridCount[c4])*K_SEPARATE - (p5 - p4)*K_PRESSURE + uz*FLOW_SPEED*K_FLOW + wz;
         }
         const damp = K_ALIGN + K_FLOW;
         let ax = 0, ay = 0, az = 0, avgPanic = 0;
         if (c >= 0)
         {
-            ax = cellAX[c] - vx*damp - px*K_COHESION;
-            ay = cellAY[c] - vy*damp - py*K_COHESION;
-            az = cellAZ[c] - vz*damp - pz*K_COHESION;
+            const coh = cellCohesion[c];
+            ax = cellAX[c] - vx*damp - px*coh;
+            ay = cellAY[c] - vy*damp - py*coh;
+            az = cellAZ[c] - vz*damp - pz*coh;
             avgPanic = cellPanic[c];
+
+            // spacing: down the fine density's slope at this bird, the trilinear gradient of the same eight nodes
+            const fx = (px - fox)/FCELL, fy = (py - foy)/FCELL, fz = (pz - foz)/FCELL;
+            const jx = Math.min(fx|0, FGX-2), jy = Math.min(fy|0, FGY-2), jz = Math.min(fz|0, FGZ-2);
+            const tx = fx - jx, ty = fy - jy, tz = fz - jz, sx = 1 - tx, sy = 1 - ty, sz = 1 - tz;
+            const f = jx + jy*FGX + jz*FGXY;
+            const d000 = fineDensity[f],          d100 = fineDensity[f+1];
+            const d010 = fineDensity[f+FGX],      d110 = fineDensity[f+FGX+1];
+            const d001 = fineDensity[f+FGXY],     d101 = fineDensity[f+FGXY+1];
+            const d011 = fineDensity[f+FGXY+FGX], d111 = fineDensity[f+FGXY+FGX+1];
+            const gx = sy*sz*(d100 - d000) + ty*sz*(d110 - d010) + sy*tz*(d101 - d001) + ty*tz*(d111 - d011);
+            const gy = sx*sz*(d010 - d000) + tx*sz*(d110 - d100) + sx*tz*(d011 - d001) + tx*tz*(d111 - d101);
+            const gz = sx*sy*(d001 - d000) + tx*sy*(d101 - d100) + sx*ty*(d011 - d010) + tx*ty*(d111 - d110);
+            const g2 = gx*gx + gy*gy + gz*gz, spread = cellSpread[c];
+            const push = g2*spread*spread > SPREAD_MAX*SPREAD_MAX ? SPREAD_MAX/Math.sqrt(g2) : spread;
+            ax -= gx*push; ay -= gy*push; az -= gz*push;
         }
         // far from the lake every bird may fly faster, see FAR_SPEEDUP
         const far = Math.sqrt(px*px + pz*pz) - FAR_RADIUS, farSpeed = far > 0 ? far*FAR_SPEEDUP : 0;
@@ -420,7 +503,8 @@ const azimuthDelta = (a, b) => { const d = (a - b) % (2*PI); return d > PI ? d -
 
 // sounds
 const windSound = new SoundGenerator({shape:4, frequency:80, attack:1, sustain:3, release:1, filter:-500, randomness:0, volume:.5});
-const whooshSound = new SoundGenerator({shape:4, frequency:300, attack:.08, release:.7, filter:-1400, volume:.8});
+// the rush of wings when the flock scatters: a soft, muffled swell, quiet under the wind
+const whooshSound = new SoundGenerator({shape:4, frequency:200, attack:.25, release:1.2, filter:-600, randomness:.2, volume:.25});
 
 ///////////////////////////////////////////////////////////////////////////////
 // the scene, built once
