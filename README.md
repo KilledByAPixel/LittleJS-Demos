@@ -9,6 +9,8 @@ Each demo is a self-contained folder with its own copy of the engine, so it runs
 
 40,000 starlings at dusk over a lake, in LittleJS 3D. Steer the hawk with the mouse to scatter the flock.
 
+![murmuration — 40,000 starlings flocking live over a dusk lake, scattered by a mouse-steered hawk](./murmuration-demo.gif)
+
 - **Mouse**: the hawk follows it, click to strike (the first click also starts the sound)
 - **G**: the flock flies away over the mountains, then returns
 - **F**: free camera (WASD to move, drag to look, Q/E down and up, Shift faster)
