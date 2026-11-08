@@ -1,0 +1,959 @@
+<!DOCTYPE html><head>
+<title>Lighthouse - LittleJS</title>
+<meta charset=utf-8>
+</head><body style=background:#000>
+<!-- LittleJS (a copy of the release build this demo was made with) -->
+<script src=littlejs.js></script>
+<script>
+'use strict';
+
+///////////////////////////////////////////////////////////////////////////////
+// Lighthouse: a lighthouse on a rocky islet in a blue hour storm. The sea heaves, rain streaks through the turning
+// beam, and lightning lights the clouds, the swells and the rocks from where it strikes. Click to call a strike.
+
+// ?cinematic: a hands free 32 second shot for video - title, three strikes, the camera's drift, end card
+const cinematic = location.search.includes('cinematic');
+const CINE_LENGTH = 32, CINE_END_CARD = 27;
+
+let hudVisible = true, slowMo = false, titleStart = -1e9, fpsSmooth = 60, lastFrameTime = 0, freeCam = false;
+// the storm's own clock: everything that should slow down in slow motion reads it instead of the engine's time
+let stormTime = 0, stormSeed = 1;
+
+///////////////////////////////////////////////////////////////////////////////
+// CAMERA BEGIN - the cinematic path, plain math only so node can test it
+//
+// The camera rides low over the swells, a few meters up, and drifts round the island along the shot's legs: hold,
+// dolly in, swing left round it, pull back and up, hold for the end card, then ease back to the start so the live
+// page loops. Positions are interpolated round the island (radius and angle, not straight lines), so the swing keeps
+// its distance instead of cutting the corner.
+
+const EYE_MIN = 3;         // never lower than this, or a swell crest would swallow the lens
+const CAM_LOOP = 40;       // the live page's loop, the cinematic's 32 seconds plus the ease home
+const CAM_LEGS = [
+    {t: 0,  pos: [0, 3.5, 68],   target: [0, 10, 0]},
+    {t: 4,  pos: [0, 3.5, 68],   target: [0, 10, 0]},
+    {t: 12, pos: [0, 3.5, 48],   target: [0, 10, 0]},
+    {t: 20, pos: [-22, 4.5, 40], target: [2, 10, 0]},
+    {t: 28, pos: [-10, 7, 60],   target: [0, 11, 0]},
+    {t: 36, pos: [-10, 7, 60],   target: [0, 11, 0]},
+    {t: CAM_LOOP, pos: [0, 3.5, 68], target: [0, 9, 0]},
+];
+
+function cameraPathAt(t)
+{
+    let k = 1;
+    while (k < CAM_LEGS.length - 1 && CAM_LEGS[k].t < t) ++k;
+    const a = CAM_LEGS[k-1], b = CAM_LEGS[k];
+    let p = Math.min(Math.max((t - a.t)/(b.t - a.t), 0), 1);
+    p = p*p*(3 - 2*p);
+    const ra = Math.hypot(a.pos[0], a.pos[2]), rb = Math.hypot(b.pos[0], b.pos[2]);
+    const aa = Math.atan2(a.pos[0], a.pos[2]), ab = Math.atan2(b.pos[0], b.pos[2]);
+    const r = ra + (rb - ra)*p, angle = aa + (ab - aa)*p;
+    const y = Math.max(EYE_MIN, a.pos[1] + (b.pos[1] - a.pos[1])*p);
+    const mix = i => a.target[i] + (b.target[i] - a.target[i])*p;
+    return {pos: vec3(r*Math.sin(angle), y, r*Math.cos(angle)), target: vec3(mix(0), mix(1), mix(2))};
+}
+// CAMERA END
+
+///////////////////////////////////////////////////////////////////////////////
+// SEA BEGIN - the waves, plain math only so node can test it
+//
+// A handful of long swells running roughly down the wind, Gerstner style: each lifts the water in a sine and pulls it
+// toward its crests, so the crests come sharp and the troughs broad. The shader below moves the vertices by the same
+// sum; seaHeightAt is its twin for the spray on the rocks, read with the engine's time as the shader's iTime is.
+
+const WIND_DIR = [.29, -.96];     // where the wind blows toward, along x and z
+const WAVES = [
+    {angle:  .00, length: 38, amp: 1.1, steep: .55, phase: 0},
+    {angle:  .45, length: 23, amp: .55, steep: .6,  phase: 2.3},
+    {angle: -.38, length: 14, amp: .3,  steep: .7,  phase: 4.1},
+    {angle:  .2,  length: 7,  amp: .1,  steep: .5,  phase: 1.7}, // in the normals only, the grid is too coarse for it
+];
+for (const w of WAVES)
+{
+    const c = Math.cos(w.angle), s = Math.sin(w.angle);
+    w.dir = [WIND_DIR[0]*c - WIND_DIR[1]*s, WIND_DIR[0]*s + WIND_DIR[1]*c];
+    w.k = 2*Math.PI/w.length;
+    w.speed = Math.sqrt(9.8/w.k); // deep water: longer swells travel faster
+}
+const SEA_DISPLACED = 3; // the first three move the grid
+
+function seaHeightAt(x, z, t)
+{
+    let y = 0;
+    for (let i = 0; i < SEA_DISPLACED; ++i)
+    {
+        const w = WAVES[i];
+        y += w.amp*Math.sin(w.k*(w.dir[0]*x + w.dir[1]*z) - w.k*w.speed*t + w.phase);
+    }
+    return y;
+}
+// SEA END
+
+const SEA_SIZE = 1000, SEA_SEGMENTS = 320;  // meters across and cells a side, about 3m a cell
+const SEA_COLOR = rgb(.08,.20,.29), FOAM_COLOR = rgb(.78,.83,.85);
+const ROCK_FOAM_RADIUS = 16;                // foam churns this far out from the island's middle
+const FOG_START = 90, FOG_END = 380, FOG_COLOR = rgb(.17,.18,.36);
+const SUN_AZIMUTH = -.6;                    // where the last of the light is, left of the first shot's view
+let sea;
+
+// the waves as GLSL constants, written from WAVES so the shader and seaHeightAt can never drift apart
+const glslWaves = WAVES.map(w => `vec4(${w.dir[0].toFixed(4)},${w.dir[1].toFixed(4)},${w.k.toFixed(4)},${(w.k*w.speed).toFixed(4)})`).join(',');
+const glslWaveShape = WAVES.map(w => `vec3(${w.amp.toFixed(4)},${(w.steep/(w.k*w.amp*WAVES.length)).toFixed(4)},${w.phase.toFixed(4)})`).join(',');
+const glslVec3 = c => `vec3(${c.r.toFixed(4)},${c.g.toFixed(4)},${c.b.toFixed(4)})`;
+const SEA_GLSL_COMMON = `
+const vec4 WAVE[${WAVES.length}] = vec4[](${glslWaves});   // direction, wavenumber, angular speed
+const vec3 SHAPE[${WAVES.length}] = vec3[](${glslWaveShape}); // amplitude, Gerstner pull, phase
+float seaHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
+float seaNoise(vec2 p)
+{
+    vec2 i = floor(p), f = fract(p);
+    f = f*f*(3. - 2.*f);
+    return mix(mix(seaHash(i), seaHash(i + vec2(1, 0)), f.x), mix(seaHash(i + vec2(0, 1)), seaHash(i + vec2(1)), f.x), f.y);
+}
+// the slope of waves first to last at a point, x and z
+vec2 seaSlope(vec2 p, int first, int last)
+{
+    vec2 s = vec2(0);
+    for (int i = first; i < last; ++i)
+    {
+        float a = WAVE[i].z*dot(WAVE[i].xy, p) - WAVE[i].w*iTime + SHAPE[i].z;
+        s += WAVE[i].xy*(SHAPE[i].x*WAVE[i].z*cos(a));
+    }
+    return s;
+}`;
+
+const SEA_SHADER = new Shader(`${SEA_GLSL_COMMON}
+const vec3 SEA = ${glslVec3(SEA_COLOR)}, FOAM = ${glslVec3(FOAM_COLOR)};
+const float CREST = ${(WAVES.slice(0, SEA_DISPLACED).reduce((s, w) => s + w.amp, 0)).toFixed(4)};
+void mainImage(out vec4 c, vec2 uv)
+{
+    // foam: streaks along the highest crests, and a churned ring round the rocks, both broken up by noise
+    vec2 p = worldPos.xz;
+    float n = seaNoise(p*.35 + vec2(iTime*.3, 0.))*.6 + seaNoise(p*1.3 - vec2(0., iTime*.5))*.4;
+    float crest = smoothstep(.5*CREST, .9*CREST, worldPos.y + (n - .5)*.5);
+    float ring = smoothstep(${ROCK_FOAM_RADIUS.toFixed(1)}, 9., length(p) + (n - .5)*7.);
+    float foam = clamp(max(crest*smoothstep(.35, .7, n), ring*smoothstep(.25, .6, n + ring*.3)), 0., 1.);
+    c = vec4(mix(vec3(1), FOAM/SEA, foam), 1);
+}
+void mainNormal(inout vec3 n)
+{
+    // the short wave and the chop the grid can't carry, added in here
+    vec2 p = worldPos.xz, s = seaSlope(p, ${SEA_DISPLACED}, ${WAVES.length});
+    vec2 q = p*.6 + vec2(iTime*.4, iTime*.15);
+    s += .12*vec2(seaNoise(q) - seaNoise(q + vec2(.5, 0)), seaNoise(q) - seaNoise(q + vec2(0, .5)))*4.;
+    n = normalize(n + vec3(-s.x, 0., -s.y));
+}`, `${SEA_GLSL_COMMON}
+void mainVertex(inout vec3 pos, inout vec3 normal)
+{
+    vec2 p = pos.xz;
+    vec3 moved = pos;
+    for (int i = 0; i < ${SEA_DISPLACED}; ++i)
+    {
+        float a = WAVE[i].z*dot(WAVE[i].xy, p) - WAVE[i].w*iTime + SHAPE[i].z;
+        moved.y += SHAPE[i].x*sin(a);
+        moved.xz += WAVE[i].xy*(SHAPE[i].y*SHAPE[i].x*cos(a)); // pulled toward the crest
+    }
+    vec2 s = seaSlope(p, 0, ${SEA_DISPLACED});
+    pos = moved;
+    normal = normalize(vec3(-s.x, 1., -s.y));
+}`);
+
+// the sky's color one way: deep blue overhead, the last warm light in a band low toward SUN_AZIMUTH, and the fog's
+// own color right at the horizon so the far sea melts into it with no seam
+function stormSkyColor(azimuth, elevation)
+{
+    const deg = elevation*180/PI;
+    const zenith = rgb(.10,.15,.36), upper = rgb(.22,.22,.48), low = rgb(.24,.22,.45);
+    let c = deg > 25 ? upper.lerp(zenith, Math.min(1, (deg - 25)/45)) : low.lerp(upper, Math.max(0, deg)/25);
+    let da = azimuth - SUN_AZIMUTH;
+    da = Math.atan2(Math.sin(da), Math.cos(da));
+    const toward = Math.max(0, 1 - Math.abs(da)/1.6)**1.5;              // how much this way faces the last light
+    const band = Math.exp(-(((deg - 3.5)/5)**2))*toward;                 // a soft band a few degrees up
+    c = c.lerp(rgb(.88,.48,.31), band*.85);
+    c = c.lerp(rgb(.95,.70,.45), Math.exp(-(((deg - 2)/2.2)**2))*toward**2*.8);
+    return c.lerp(FOG_COLOR, Math.max(0, 1 - Math.max(0, deg)/2.5)*(1 - toward*.7)); // the horizon line itself
+}
+
+// a dome round the camera, fine near the horizon where the band changes fastest; below it the fog's color
+function buildStormSky()
+{
+    const mesh = new Mesh, SIDES = 160, rows = [-PI/2, -.2, -.02];
+    for (let e = 0; e < .3; e += .012) rows.push(e);
+    for (let e = .3; e < PI/2; e += .08) rows.push(e);
+    rows.push(PI/2);
+    const up = vec3(0, 1, 0);
+    for (let j = 0; j < rows.length - 1; ++j)
+    {
+        const points = [], colors = [];
+        for (let i = 0; i <= SIDES; ++i)
+        {
+            const a = i/SIDES*2*PI;
+            for (const e of [rows[j+1], rows[j]])
+            {
+                points.push(vec3(Math.sin(a)*Math.cos(e), Math.sin(e), -Math.cos(a)*Math.cos(e)));
+                colors.push(e < 0 ? FOG_COLOR : stormSkyColor(a, e));
+            }
+        }
+        mesh.addStrip(points, up, undefined, colors);
+    }
+    mesh.doubleSided = true;
+    // what the sea reflects: the engine looks a sky's colors up by its mesh, as buildSky registers them, so this
+    // dome registers its own, overhead, toward the horizon (the band's warmth averaged in), and below
+    render3DSkyColors.set(mesh, [rgb(.16,.18,.42), rgb(.33,.31,.52), FOG_COLOR]);
+    return mesh;
+}
+
+function buildSea()
+{
+    const mesh = buildGrid(vec2(SEA_SIZE), SEA_SEGMENTS, SEA_COLOR);
+    sea = new EngineObject3D(vec3(), mesh);
+    sea.shader = SEA_SHADER;
+    sea.specular = 1.2;
+    sea.shininess = 60;
+    sea.reflectivity = .35;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ISLAND BEGIN - where the rocks lie, plain math only so node can test it
+//
+// The islet is a rocky mound with the lighthouse on its crown; round it lie a few big tilted slabs and a jumble of
+// boulders, some sunk deep so the swells break over them. Seeded, so every run and every recording is the same rock.
+
+const ISLAND_RADIUS = 12;   // no rock reaches further from the middle than this
+const SHELF_Y = 4;          // the crown the tower stands on, high enough to stand clear of the swells
+
+function rockLayout(seed)
+{
+    let s = (seed*2654435761 >>> 0) || 1;
+    const random = (a=0, b=1) => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return a + (b - a)*(s >>> 0)/4294967296; };
+    const rocks = [];
+    const place = (radiusMin, radiusMax, size, y, kind) =>
+    {
+        const angle = random(0, 2*Math.PI), r = random(radiusMin, radiusMax);
+        const reach = Math.max(size[0], size[2])/2*.7; // keep the rock's own bulk inside the island too
+        const d = Math.min(r, ISLAND_RADIUS - reach);
+        rocks.push({kind, x: Math.sin(angle)*d, y, z: Math.cos(angle)*d, sx: size[0], sy: size[1], sz: size[2],
+            yaw: random(0, Math.PI), pitch: random(-.3, .3)});
+    };
+    // slabs leaning out from the mound, the island's big shapes
+    const slabs = 3 + (random()*3 | 0);
+    for (let i = 0; i < slabs; ++i)
+        place(5, 8, [random(6, 9), random(2, 3), random(4, 6)], random(.5, 2.1), 'slab');
+    // sunk foundations the swells foam over
+    for (let i = 0; i < 4; ++i)
+        place(7, 11, [random(3, 5), 3.5, random(3, 5)], -2.6, 'boulder');
+    // the jumble
+    const boulders = 10 + (random()*7 | 0);
+    for (let i = 0; i < boulders; ++i)
+    {
+        const size = random(1.5, 3.6);
+        place(4, 11.5, [size*random(.9, 1.4), size*random(.6, 1), size*random(.9, 1.4)], random(-.5, 2.5), 'boulder');
+    }
+    return rocks;
+}
+// ISLAND END
+
+const LANTERN_Y = SHELF_Y + 15.5, TOWER_HEIGHT = SHELF_Y + 19.3; // the middle of the lantern room, and the finial
+const ROCK_COLOR = rgb(.36,.37,.40), TOWER_WHITE = rgb(.92,.92,.95), TOWER_RED = rgb(.75,.18,.15);
+const LANTERN_COLOR = rgb(1,.82,.56), WINDOW_COLOR = rgb(1,.69,.38);
+let islandObject, towerObject, lanternObject, lanternLight, lanternFlare, cottageLight;
+
+// one mesh of every rock and the mound under the tower, flat shaded and faceted for the clean stylized look
+function buildIsland()
+{
+    const mesh = buildLathe([[0, -5], [10.5, -5], [9, -1.5], [7.5, 1.4], [6, SHELF_Y - .3], [4.8, SHELF_Y], [0, SHELF_Y]], 9, false);
+    mesh.setColor(ROCK_COLOR.scale(.9, 1));
+    const slab = buildBox(1, .12, 1), boulder = buildSphere(1, 7, 4, false);
+    let k = 0;
+    for (const r of rockLayout(1))
+    {
+        const shade = .85 + .3*((k++*.618) % 1);
+        const matrix = buildMatrix(vec3(r.x, r.y, r.z), vec3(r.pitch, r.yaw, r.pitch*.5), vec3(r.sx, r.sy, r.sz));
+        mesh.combine(r.kind == 'slab' ? slab : boulder, matrix, ROCK_COLOR.scale(shade, 1));
+    }
+    islandObject = new EngineObject3D(vec3(), mesh);
+    islandObject.specular = .35; // wet rock, the lightning glints on it
+    islandObject.shininess = 24;
+}
+
+// the tower in white and red rings, its gallery, the glass lantern room and the red cap; the room glows on its own.
+// Built from its foot up and stood on the crown
+function buildLighthouse()
+{
+    const mesh = new Mesh;
+    const radiusAt = y => 2.6 + (1.9 - 2.6)*y/13;
+    const bands = [[0, 4, TOWER_WHITE], [4, 6, TOWER_RED], [6, 9, TOWER_WHITE], [9, 11, TOWER_RED], [11, 13, TOWER_WHITE]];
+    for (const [y0, y1, color] of bands)
+        mesh.combine(buildLathe([[radiusAt(y0), y0], [radiusAt(y1), y1]], 28, true, false), undefined, color);
+    const iron = rgb(.16,.17,.2);
+    mesh.combine(buildCylinder(5.8, .5, 28, true), vec3(0, 13.25, 0), iron);       // gallery floor
+    mesh.combine(buildTorus(5.5, .12, 28, 6, true), vec3(0, 14.4, 0), iron);       // its rail
+    for (let i = 0; i < 12; ++i)                                                   // and the rail's posts
+        mesh.combine(buildCylinder(.1, .9, 4), vec3(2.75*Math.sin(i/12*2*PI), 13.95, 2.75*Math.cos(i/12*2*PI)), iron);
+    mesh.combine(buildCylinder(3.4, .4, 20, true), vec3(0, 17.2, 0), TOWER_RED);   // cap rim
+    mesh.combine(buildCone(3.6, 1.6, 20, true), vec3(0, 18.2, 0), TOWER_RED);      // cap
+    mesh.combine(buildSphere(.4, 8, 4, true), vec3(0, 19.1, 0), iron);             // finial
+    towerObject = new EngineObject3D(vec3(0, SHELF_Y, 0), mesh);
+    towerObject.specular = .25;
+
+    // the glass, lit from inside: drawn in its own warm color, bright enough to bloom
+    lanternObject = new EngineObject3D(vec3(0, LANTERN_Y, 0), buildCylinder(3, 3, 16, true), undefined, LANTERN_COLOR);
+    lanternObject.emissive = 1.6;
+    lanternLight = new Light3D(vec3(0, LANTERN_Y, 0), 30, LANTERN_COLOR, 2);
+    lanternFlare = lanternLight.addFlare(undefined, undefined, .2); // faint until the beam swings toward the camera
+}
+
+// the keeper's cottage beside the tower: stone walls, a slate roof and one warm window
+function buildCottage()
+{
+    const yaw = -.5, pos = vec3(4.1, SHELF_Y, -2.4);
+    const mesh = buildBox(vec3(4.6, 2.8, 3.6), .08).setColor(rgb(.72,.70,.66));
+    mesh.transform(buildMatrix(vec3(0, 1.4, 0)));
+    mesh.combine(buildBox(vec3(5, 2.7, 2.7), .05), buildMatrix(vec3(0, 2.8, 0), vec3(0, 0, PI/4), vec3(1, .75, 1)), rgb(.22,.24,.3));
+    mesh.combine(buildBox(vec3(.7, 1.6, .7)), vec3(1.6, 4.2, 0), rgb(.5,.47,.44)); // chimney
+    const cottage = new EngineObject3D(pos, mesh);
+    cottage.rotation3D = vec3(0, yaw, 0);
+
+    // the window on the side that faces the sea and the camera
+    const front = vec3(Math.sin(yaw), 0, Math.cos(yaw));
+    const windowPos = pos.add(front.scale(1.82)).add(vec3(0, 1.5, 0));
+    const pane = new EngineObject3D(windowPos, buildBox(vec3(1, .8, .06)), undefined, WINDOW_COLOR);
+    pane.rotation3D = vec3(0, yaw, 0);
+    pane.emissive = 1.3;
+    cottageLight = new Light3D(windowPos.add(front.scale(1.2)), 9, WINDOW_COLOR, 1);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// LIGHTNING BEGIN - the strike schedule, the flicker and the bolt's path, plain math only so node can test it
+//
+// A strike is light first: a few point lights at the bolt and in the cloud layer, flaring on a hand made flicker
+// (full, a dip, a second stroke, a fade) over less than half a second, so the sea, the rocks and the cloud bellies
+// light up from where it is. The bolt itself is a jagged line, bright enough to bloom. Everything about when and
+// where comes from the storm's seed, so a recording shows the same storm every time.
+
+const STRIKE_LENGTH = .45;          // seconds a strike lights the scene
+const CLOUD_BASE_Y = 45;            // the cloud layer's underside
+const STRIKE_GAP_MIN = 4, STRIKE_GAP_MAX = 9;
+
+function flicker(age)
+{
+    if (age < 0 || age >= STRIKE_LENGTH) return 0;
+    if (age < .05) return 1;
+    if (age < .09) return 1 - .75*(age - .05)/.04;
+    if (age < .14) return .25 + .55*(age - .09)/.05;
+    const fade = 1 - (age - .14)/(STRIKE_LENGTH - .14);
+    return .8*fade*fade;
+}
+
+// when and where the storm strikes: the cinematic's three set pieces, or a long seeded run for the live page.
+// Live strikes stay in the half of the sea the camera faces, never nearer the camera's path than 40m
+function makeSchedule(random, cinematic)
+{
+    if (cinematic)
+        return [
+            {t: 4,  kind: 'cloud',  x: -30, y: CLOUD_BASE_Y, z: -90},
+            {t: 12, kind: 'ground', x: 45,  y: 0, z: -20},
+            {t: 20, kind: 'ground', x: 18,  y: 0, z: -34, big: true},
+        ];
+    const strikes = [];
+    for (let t = 2 + random()*3; t < 3600; t += STRIKE_GAP_MIN + random()*(STRIKE_GAP_MAX - STRIKE_GAP_MIN))
+    {
+        const cloud = random() < .6, angle = (random()*2 - 1)*1.4, r = 30 + random()*90;
+        strikes.push({t, kind: cloud ? 'cloud' : 'ground', x: r*Math.sin(angle), y: cloud ? CLOUD_BASE_Y : 0,
+            z: -r*Math.cos(angle), big: !cloud && random() < .2});
+    }
+    return strikes;
+}
+
+// a bolt from a to b: the line split in half four times, each midpoint knocked aside by a share of its segment's
+// length, and one branch forking off partway down
+function boltPoints(a, b, seed)
+{
+    let s = (seed*2246822519 >>> 0) || 1;
+    const random = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0)/4294967296 - .5; };
+    const split = (points, rounds, rough) =>
+    {
+        for (let r = 0; r < rounds; ++r)
+        {
+            const next = [points[0]];
+            for (let i = 1; i < points.length; ++i)
+            {
+                const p = points[i-1], q = points[i], len = Math.hypot(q.x - p.x, q.y - p.y, q.z - p.z)*rough;
+                next.push({x: (p.x + q.x)/2 + random()*len, y: (p.y + q.y)/2 + random()*len*.5, z: (p.z + q.z)/2 + random()*len}, q);
+            }
+            points = next;
+        }
+        return points;
+    };
+    const main = split([{...a}, {...b}], 4, .55);
+    const from = main[7 + (random() + .5)*4 | 0], reach = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z)*.35;
+    const end = {x: from.x + (random()*1.2 + Math.sign(random() || 1)*.4)*reach, y: from.y - reach*(.6 + random()*.4),
+        z: from.z + random()*reach};
+    return {main, branch: split([{...from}, end], 3, .5)};
+}
+// LIGHTNING END
+
+const LIGHTNING_POOL = 6, LIGHTNING_COLOR = rgb(.87,.91,1);
+const STRIKE_RADIUS = 150, STRIKE_INTENSITY = 4, BIG_STRIKE_INTENSITY = 6;
+const lightningLights = [], strikes = [];
+let strikeSchedule = [], nextStrike = 0, stormRandom, strikeCount = 0;
+
+// the lights a strike borrows, made once and switched off between strikes
+function buildLightning()
+{
+    for (let i = 0; i < LIGHTNING_POOL; ++i)
+        lightningLights.push(new Light3D(vec3(), STRIKE_RADIUS, LIGHTNING_COLOR, 0));
+    render3D.onRenderTransparent = () => { drawClouds(); drawBolts(); };
+}
+
+// a new storm from the seed: R steps the seed, so the live page shows another storm
+function scheduleStrikes()
+{
+    stormRandom = new RandomGenerator(stormSeed);
+    strikeSchedule = makeSchedule(() => stormRandom.float(), cinematic);
+    nextStrike = 0;
+    while (strikes.length) endStrike(strikes[0]);
+}
+
+function endStrike(strike)
+{
+    for (const light of strike.lights) light.intensity = 0;
+    strikes.splice(strikes.indexOf(strike), 1);
+}
+
+// kind is 'cloud' (lights inside the layer, a bolt across it) or 'ground' (a bolt down to pos, a light where it hits)
+function startStrike(kind, pos, big=false, at=stormTime)
+{
+    const count = big ? 3 : 2;
+    const free = () => lightningLights.filter(l => !strikes.some(s => s.lights.includes(l)));
+    while (free().length < count && strikes.length) endStrike(strikes[0]); // too many at once: the oldest goes dark
+    const lights = free().slice(0, count), seed = ++strikeCount*7.31 + stormSeed;
+    let bolt;
+    if (kind == 'cloud')
+    {
+        // the bolt runs across the underside of the layer, the lights strung along it inside the cloud
+        const angle = (seed*1.7) % (2*PI), span = 50 + (seed*13.1) % 30;
+        const a = {x: pos.x - Math.cos(angle)*span/2, y: pos.y, z: pos.z - Math.sin(angle)*span/2};
+        const b = {x: pos.x + Math.cos(angle)*span/2, y: pos.y - 4, z: pos.z + Math.sin(angle)*span/2};
+        bolt = boltPoints(a, b, seed);
+        lights.forEach((l, i) => l.pos3D = vec3(a.x + (b.x - a.x)*(i + .5)/count, pos.y + 6, a.z + (b.z - a.z)*(i + .5)/count));
+    }
+    else
+    {
+        // from the cloud base straight above, down to the water; one light just over the strike point, the rest up
+        // in the cloud it came out of
+        const top = {x: pos.x + ((seed*3.3) % 20) - 10, y: CLOUD_BASE_Y, z: pos.z + ((seed*5.7) % 20) - 10};
+        bolt = boltPoints(top, {x: pos.x, y: pos.y, z: pos.z}, seed);
+        lights.forEach((l, i) => l.pos3D = i ? vec3(top.x + (i - 1.5)*15, CLOUD_BASE_Y + 6, top.z) : vec3(pos.x, pos.y + 4, pos.z));
+    }
+    const toVec = list => list.map(p => vec3(p.x, p.y, p.z));
+    strikes.push({kind, start: at, big, lights, main: toVec(bolt.main), branch: toVec(bolt.branch)});
+}
+
+// each frame: start what the schedule says is due, and drive every live strike's lights by its flicker
+function updateLightning()
+{
+    while (nextStrike < strikeSchedule.length && strikeSchedule[nextStrike].t <= stormTime)
+    {
+        const s = strikeSchedule[nextStrike++], p = strikeTarget(s.kind, s.x, s.y, s.z, time);
+        startStrike(s.kind, vec3(p.x, p.y, p.z), s.big, s.t);
+    }
+    for (const strike of [...strikes])
+    {
+        const age = stormTime - strike.start;
+        if (age >= STRIKE_LENGTH) { endStrike(strike); continue; }
+        const f = flicker(age);
+        for (const light of strike.lights)
+            light.intensity = f*(strike.big ? BIG_STRIKE_INTENSITY : STRIKE_INTENSITY);
+    }
+}
+
+// the bolts, in the transparent stage: a wide faint glow round a thin white core, added onto the scene
+function drawBolts()
+{
+    if (!strikes.length) return;
+    render3D.additive = true;
+    for (const strike of strikes)
+    {
+        const f = flicker(stormTime - strike.start);
+        if (f <= 0) continue;
+        const width = strike.big ? 1.6 : 1;
+        for (const [points, scale] of [[strike.main, 1], [strike.branch, .6]])
+        {
+            render3D.drawRibbon(points, 3*width*scale, undefined, rgb(.5,.6,1,.35*f));
+            render3D.drawRibbon(points, .5*width*scale, undefined, rgb(1,1,1,f));
+        }
+    }
+    render3D.additive = false;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// CLOUDS BEGIN - where the cloud puffs are and how they drift, plain math only so node can test it
+//
+// Three layers of big soft puffs low over the sea, the lowest at the base the lightning comes out of, each drifting
+// downwind at its own pace and wrapping round inside a box centered on the island, so the sky never empties.
+
+const CLOUD_COUNT = 48, CLOUD_BOX = 360;
+const CLOUD_LAYERS = [CLOUD_BASE_Y, CLOUD_BASE_Y + 12, CLOUD_BASE_Y + 24];
+const CLOUD_SPEEDS = [1.5, 2.2, 3];   // meters a second, the higher layers faster
+
+function cloudLayout(seed)
+{
+    let s = (seed*2654435761 >>> 0) || 1;
+    const random = (a=0, b=1) => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return a + (b - a)*(s >>> 0)/4294967296; };
+    const clouds = [];
+    for (let i = 0; i < CLOUD_COUNT; ++i)
+    {
+        const layer = i % CLOUD_LAYERS.length;
+        clouds.push({layer, x: random(-.5, .5)*CLOUD_BOX, y: CLOUD_LAYERS[layer] + random(-2.5, 2.5),
+            z: random(-.5, .5)*CLOUD_BOX, size: random(60, 110), squash: random(.45, .65), shade: random(.85, 1.1),
+            alpha: random(.55, .8), angle: random(-.2, .2)});
+    }
+    return clouds;
+}
+
+function cloudPosAt(cloud, t)
+{
+    const wrap = v => ((v + CLOUD_BOX/2) % CLOUD_BOX + CLOUD_BOX) % CLOUD_BOX - CLOUD_BOX/2;
+    const d = CLOUD_SPEEDS[cloud.layer]*t;
+    return {x: wrap(cloud.x + WIND_DIR[0]*d), y: cloud.y, z: wrap(cloud.z + WIND_DIR[1]*d)};
+}
+// CLOUDS END
+
+// colors for lit billboards: each is lit by the ambient, the low warm sun and any lightning near it, so the color
+// here is brighter than it shows; the higher layers a little darker and bluer
+const CLOUD_COLORS = [rgb(.62,.62,.82), rgb(.52,.54,.76), rgb(.42,.45,.68)];
+let clouds, cloudTile;
+
+// a soft puff drawn once into a canvas: a few overlapping round glows, white fading to clear
+function buildClouds()
+{
+    const size = 128, canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const context = canvas.getContext('2d');
+    for (const [x, y, r] of [[.5, .55, .42], [.32, .6, .28], [.68, .58, .3], [.45, .42, .28], [.6, .45, .24]])
+    {
+        const g = context.createRadialGradient(x*size, y*size, 0, x*size, y*size, r*size);
+        g.addColorStop(0, 'rgba(255,255,255,.55)');
+        g.addColorStop(.6, 'rgba(255,255,255,.25)');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        context.fillStyle = g;
+        context.fillRect(0, 0, size, size);
+    }
+    cloudTile = new TextureInfo(canvas);
+    clouds = cloudLayout(stormSeed);
+}
+
+// in the transparent stage, sorted far to near by the engine with the rest
+function drawClouds()
+{
+    for (const c of clouds)
+    {
+        const p = cloudPosAt(c, stormTime), base = CLOUD_COLORS[c.layer];
+        render3D.drawBillboard(vec3(p.x, p.y, p.z), vec2(c.size, c.size*c.squash), cloudTile,
+            rgb(base.r*c.shade, base.g*c.shade, base.b*c.shade, c.alpha), c.angle);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// CINE BEGIN - the cinematic's curves, plain math only so node can test it
+//
+// After the big strike the storm closes in: the rain thickens over the last stretch before the end card. The big
+// strike also kicks the picture apart into a chromatic fringe for its brightest frames, as an overexposed lens does.
+
+const CINE_RAIN_START = 20, CINE_RAIN_FULL = 28, CINE_RAIN_MAX = 1.6;
+
+function cineRainRate(t)
+{
+    const p = Math.min(Math.max((t - CINE_RAIN_START)/(CINE_RAIN_FULL - CINE_RAIN_START), 0), 1);
+    return 1 + (CINE_RAIN_MAX - 1)*p*p*(3 - 2*p);
+}
+
+const bigStrikeChroma = age => .012*flicker(age);
+// CINE END
+
+// the picture as a whole: the fringe first since it samples the frame, then bloom for the lamp, the bolts and the
+// beam, and a soft vignette to hold the eye on the tower
+function buildPost()
+{
+    new PostProcessPlugin(postProcessEffects(postProcessChromatic('chroma'), postProcessGlow(.72, .8, 8),
+        postProcessVignette(.55, 2.5)));
+    postProcess.values.chroma = 0;
+}
+
+function updatePost()
+{
+    let chroma = 0;
+    for (const strike of strikes)
+        if (strike.big) chroma = Math.max(chroma, bigStrikeChroma(stormTime - strike.start));
+    postProcess.values.chroma = chroma;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// BEAM BEGIN - the beam's turn, which raindrops are in it, and the rain's fall, plain math only so node can test it
+//
+// The beam is not a light: it shines into the air with nothing to land on, so it is only what you see of it, a
+// long soft cone of light in the rain. Two of them back to back turn level from the lantern, as a real lamp's do.
+// The rain is a box of streaks round the camera, falling and blowing downwind, wrapping as the camera moves.
+
+const BEAM_PERIOD = 6;                        // seconds a turn
+const BEAM_LENGTH = 160, BEAM_RADIUS_START = .7, BEAM_RADIUS_END = 9;
+const RAIN_BOX = 90, RAIN_TOP = CLOUD_BASE_Y - 5, RAIN_BOTTOM = -2;
+const RAIN_SPEED = 22, RAIN_WIND = 6;         // meters a second down, and along the wind
+
+const beamYawAt = t => 2*Math.PI*t/BEAM_PERIOD;
+
+// is a point inside the beam turned to yaw (0 shines down -Z, as the camera's yaw does)
+function insideBeamMath(px, py, pz, yaw)
+{
+    const dx = -Math.sin(yaw), dz = -Math.cos(yaw);
+    const vx = px, vy = py - LANTERN_Y, vz = pz;
+    const along = vx*dx + vz*dz;
+    if (along <= 0 || along > BEAM_LENGTH) return false;
+    const radius = BEAM_RADIUS_START + (BEAM_RADIUS_END - BEAM_RADIUS_START)*along/BEAM_LENGTH;
+    const ox = vx - dx*along, oz = vz - dz*along;
+    return ox*ox + vy*vy + oz*oz < radius*radius;
+}
+
+// one drop's step: down and downwind, wrapped into the box round the camera and back to the top once it is under
+// the water, so the same few thousand streaks are always where the camera can see them
+function rainStep(x, y, z, dt, cameraX, cameraZ)
+{
+    const wrap = (v, c) => c + ((v - c + RAIN_BOX/2) % RAIN_BOX + RAIN_BOX) % RAIN_BOX - RAIN_BOX/2;
+    x += WIND_DIR[0]*RAIN_WIND*dt;
+    z += WIND_DIR[1]*RAIN_WIND*dt;
+    y -= RAIN_SPEED*dt;
+    if (y < RAIN_BOTTOM) y += RAIN_TOP - RAIN_BOTTOM;
+    return {x: wrap(x, cameraX), y, z: wrap(z, cameraZ)};
+}
+// BEAM END
+
+const BEAM_COLOR = rgb(1,.89,.66);
+const RAIN_COUNT = 3000;                      // streaks in the box, raised by the cinematic's rain rate
+const RAIN_MAX = Math.ceil(RAIN_COUNT*CINE_RAIN_MAX);
+const RAIN_CLEAR = 6;                         // drops nearer the lens than this are hidden, or they'd fill the frame as bars
+const SPRAY_HEIGHT = .9;                      // a swell higher than this at a windward rock throws spray
+let beamYaw = 0, beams = [], rain, sprays = [];
+
+// the visible beam: brightest along its middle and at the lamp, fading toward its far end and its edges as a lit
+// haze would, so its sides never show as a hard cone
+const BEAM_SHADER = new Shader(`
+void mainImage(out vec4 c, vec2 uv)
+{
+    vec3 toEye = normalize(cameraPos - worldPos), n = normalize(worldNormal);
+    float edge = pow(abs(dot(n, toEye)), 1.6);
+    float along = clamp(length(worldPos - vec3(0, ${LANTERN_Y.toFixed(2)}, 0))/${BEAM_LENGTH.toFixed(1)}, 0., 1.);
+    float fade = pow(1. - along, 1.8)*smoothstep(0., .02, along);
+    c = vec4(vec3(1), edge*fade*.32);
+}`);
+
+function buildBeams()
+{
+    const mesh = buildLathe([[BEAM_RADIUS_START, 0], [BEAM_RADIUS_END, BEAM_LENGTH]], 32, true, false);
+    for (let i = 0; i < 2; ++i)
+    {
+        const beam = new EngineObject3D(vec3(0, LANTERN_Y, 0), mesh, undefined, BEAM_COLOR);
+        beam.shader = BEAM_SHADER;
+        beam.additive = beam.transparent = true;
+        beam.emissive = 1;
+        beams.push(beam);
+    }
+}
+
+// how squarely a beam faces the camera, 0 to 1: the lamp's flare swells as one sweeps across the lens
+function beamStrength()
+{
+    const camera = render3D.camera.pos, dx = camera.x, dy = camera.y - LANTERN_Y, dz = camera.z;
+    const d = Math.hypot(dx, dy, dz) || 1;
+    let best = 0;
+    for (const yaw of [beamYaw, beamYaw + PI])
+        best = Math.max(best, (-Math.sin(yaw)*dx - Math.cos(yaw)*dz)/d);
+    return smoothStep(percent(best, .93, 1));
+}
+
+function updateBeams()
+{
+    beamYaw = beamYawAt(stormTime);
+    // laid on its side along -Z, then turned to face its way
+    beams.forEach((beam, i) => beam.rotation3D = vec3(-PI/2, beamYaw + i*PI, 0));
+    lanternFlare.intensity = .2 + 1.8*beamStrength();
+}
+
+// the rain: thin streaks, lit, so the lightning brightens them, and brighter still inside the beam
+class Rain extends InstancedMesh3D
+{
+    constructor()
+    {
+        super(buildBox(vec3(.06, 1.4, .06)), RAIN_MAX, undefined, rgb(.75,.8,.95,.25));
+        this.transparent = true;
+        this.radius = 1e4;
+        // half its own pale color, half lit, so a streak never goes gray against the sky and still flares with a strike
+        this.emissive = .5;
+        const n = RAIN_MAX;
+        this.x = new Float32Array(n), this.y = new Float32Array(n), this.z = new Float32Array(n);
+        this.rx = new Float32Array(n), this.ry = new Float32Array(n), this.rz = new Float32Array(n);
+        this.inBeam = new Uint8Array(n);
+        this.scale = new Float32Array(n).fill(1);
+        // spread through the box with a fixed seed, so recordings match
+        let s = 12345;
+        const random = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0)/4294967296; };
+        for (let i = 0; i < n; ++i)
+        {
+            this.x[i] = (random() - .5)*RAIN_BOX;
+            this.y[i] = RAIN_BOTTOM + random()*(RAIN_TOP - RAIN_BOTTOM);
+            this.z[i] = (random() - .5)*RAIN_BOX + 60;
+        }
+        // leaning with the wind: tipped forward along it by the angle its sideways drift makes with its fall
+        const lean = Math.atan2(RAIN_WIND, RAIN_SPEED);
+        this.rx.fill(lean*-WIND_DIR[1]);
+        this.rz.fill(lean*-WIND_DIR[0]);
+    }
+
+    step(dt)
+    {
+        // all of them fall, the first count of them draw, so more rain starts already spread through the box
+        this.count = Math.round(RAIN_COUNT*(cinematic ? cineRainRate(stormTime) : 1));
+        const camera = render3D.camera.pos, inside = rgb(.95,.93,.85,.5), outside = rgb(.75,.8,.95,.22);
+        for (let i = 0; i < RAIN_MAX; ++i)
+        {
+            const p = rainStep(this.x[i], this.y[i], this.z[i], dt, camera.x, camera.z);
+            this.x[i] = p.x, this.y[i] = p.y, this.z[i] = p.z;
+            this.scale[i] = (p.x - camera.x)**2 + (p.y - camera.y)**2 + (p.z - camera.z)**2 < RAIN_CLEAR*RAIN_CLEAR ? 0 : 1;
+            const lit = insideBeamMath(p.x, p.y, p.z, beamYaw) || insideBeamMath(p.x, p.y, p.z, beamYaw + PI) ? 1 : 0;
+            if (lit !== this.inBeam[i])
+                this.inBeam[i] = lit, this.setColorAt(i, lit ? inside : outside);
+        }
+        this.setTransforms(0, RAIN_MAX, this.x, this.y, this.z, this.rx, this.ry, this.rz, this.scale, this.scale, this.scale);
+    }
+}
+
+// spray on the windward rocks: a burst each time a big swell reaches one
+function buildSpray()
+{
+    const windward = rockLayout(1).filter(r => r.kind == 'boulder')
+        .sort((a, b) => (a.x*WIND_DIR[0] + a.z*WIND_DIR[1]) - (b.x*WIND_DIR[0] + b.z*WIND_DIR[1])).slice(0, 4);
+    for (const r of windward)
+    {
+        const spray = new ParticleEmitter3D(vec3(r.x, .6, r.z), 2.5, 0, 0, PI/5, cloudTile,
+            rgb(1,1,1,.8), rgb(.85,.9,.95,.6), rgb(1,1,1,0), rgb(.9,.95,1,0), 1, .5, 2, .13, .985, -.0028, .3, .35);
+        spray.rock = r;
+        sprays.push(spray);
+    }
+}
+
+function updateSpray()
+{
+    // engine time, as the sea shader's waves run on it
+    for (const spray of sprays)
+        spray.emitRate = seaHeightAt(spray.rock.x, spray.rock.z, time) > SPRAY_HEIGHT ? 140 : 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// CLICK BEGIN - where a click calls the lightning down, plain math only so node can test it
+//
+// The click's ray from the camera picks the strike: the lighthouse itself if it passes through the tower, the rocks
+// if it meets the islet, the sea where it comes down to the water, the cloud base where it goes up into it, and far
+// out on the sea if it does neither within reach, so every click strikes somewhere.
+
+const STRIKE_REACH = 400;   // meters across the sea a click can reach
+const TOWER_RADIUS = 2.6, MOUND_RADIUS = 9;
+
+function resolveStrike(ox, oy, oz, dx, dy, dz)
+{
+    // where the ray first meets a vertical cylinder round the island's middle, between two heights
+    const cylinder = (radius, bottom, top) =>
+    {
+        const a = dx*dx + dz*dz, b = 2*(ox*dx + oz*dz), c = ox*ox + oz*oz - radius*radius;
+        const disc = b*b - 4*a*c;
+        if (a < 1e-12 || disc < 0) return;
+        for (const t of [(-b - Math.sqrt(disc))/(2*a), (-b + Math.sqrt(disc))/(2*a)])
+            if (t > 0 && oy + dy*t >= bottom && oy + dy*t <= top) return t;
+    };
+    const at = (t, kind) => ({kind, x: ox + dx*t, y: Math.max(0, oy + dy*t), z: oz + dz*t});
+
+    const tower = cylinder(TOWER_RADIUS, SHELF_Y, TOWER_HEIGHT);
+    const mound = cylinder(Math.min(MOUND_RADIUS, ISLAND_RADIUS), -1, SHELF_Y);
+    if (tower !== undefined && (mound === undefined || tower < mound))
+        return {kind: 'tower', x: 0, y: TOWER_HEIGHT, z: 0};
+    if (mound !== undefined)
+        return at(mound, 'ground');
+    if (dy < 0)
+    {
+        const t = -oy/dy, reach = Math.hypot(dx, dz)*t;
+        if (reach <= STRIKE_REACH)
+            return at(t, 'ground');
+    }
+    else if (dy > 0)
+    {
+        const t = (CLOUD_BASE_Y - oy)/dy;
+        if (Math.hypot(dx, dz)*t <= STRIKE_REACH)
+            return {kind: 'cloud', x: ox + dx*t, y: CLOUD_BASE_Y, z: oz + dz*t};
+    }
+    // toward the horizon: down to the sea as far out as a click reaches, in the direction clicked
+    const h = Math.hypot(dx, dz);
+    if (h < 1e-9) return {kind: 'ground', x: ox, y: 0, z: oz};
+    return {kind: 'ground', x: ox + dx/h*STRIKE_REACH*.75, y: 0, z: oz + dz/h*STRIKE_REACH*.75};
+}
+// a resolved strike's final place: on the sea it meets the swell under it, read with the engine's time as the
+// shader's waves are, so the bolt's foot never hides inside a crest; up in the layer for a cloud strike
+function strikeTarget(kind, x, y, z, t)
+{
+    if (kind == 'cloud') return {x, y: CLOUD_BASE_Y + 8, z};
+    if (kind == 'ground' && y <= 0) return {x, y: seaHeightAt(x, z, t), z};
+    return {x, y, z};
+}
+// CLICK END
+
+// a click: lightning where it points, the cloud kind up in the layer like the scheduled ones
+function clickStrike()
+{
+    const ray = render3D.screenToRay(mousePosScreen), o = ray.origin, d = ray.direction;
+    const s = resolveStrike(o.x, o.y, o.z, d.x, d.y, d.z), p = strikeTarget(s.kind, s.x, s.y, s.z, time);
+    startStrike(s.kind == 'cloud' ? 'cloud' : 'ground', vec3(p.x, p.y, p.z), s.kind == 'tower');
+}
+
+const CAM_FOV = .9; // radians, a touch long so the tower doesn't lean
+// free cam: F flies it (WASD, drag to look, Q/E down and up, Shift faster), meters a second and radians a pixel
+const FREE_CAM_SPEED = 12, FREE_CAM_FAST = 40, FREE_CAM_TURN = .004;
+const freeCamPos = vec3(), freeLook = {yaw: 0, pitch: 0};
+let camYaw = 0; // which way the camera faces, 0 down -Z
+
+function updateCamera()
+{
+    const camera = render3D.camera;
+    if (freeCam)
+    {
+        const {yaw, pitch} = freeLook;
+        camYaw = yaw;
+        camera.pos = freeCamPos.copy();
+        camera.lookAt(freeCamPos.add(vec3(-Math.sin(yaw)*Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw)*Math.cos(pitch))));
+        return;
+    }
+    const {pos, target} = cameraPathAt(cinematic ? stormTime : stormTime % CAM_LOOP);
+    camera.pos = pos;
+    camera.lookAt(target);
+    const look = target.subtract(pos);
+    camYaw = Math.atan2(-look.x, -look.z);
+}
+
+function updateFreeCam()
+{
+    if (mouseIsDown(0))
+    {
+        freeLook.yaw -= mouseDeltaScreen.x*FREE_CAM_TURN;
+        freeLook.pitch = clamp(freeLook.pitch - mouseDeltaScreen.y*FREE_CAM_TURN, -1.4, 1.4);
+    }
+    const {yaw, pitch} = freeLook, move = keyDirection();
+    const speed = (keyIsDown('ShiftLeft') || keyIsDown('ShiftRight') ? FREE_CAM_FAST : FREE_CAM_SPEED)/60;
+    const forward = vec3(-Math.sin(yaw)*Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw)*Math.cos(pitch));
+    const right = vec3(Math.cos(yaw), 0, -Math.sin(yaw));
+    const climb = (keyIsDown('KeyE') ? 1 : 0) - (keyIsDown('KeyQ') ? 1 : 0);
+    const step = forward.scale(move.y).add(right.scale(move.x)).add(vec3(0, climb, 0)).scale(speed);
+    freeCamPos.set(freeCamPos.x + step.x, Math.max(.5, freeCamPos.y + step.y), freeCamPos.z + step.z);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameInit()
+{
+    new Render3DPlugin;
+    render3D.sky = buildStormSky();
+    render3D.setFog(FOG_START, FOG_END, FOG_COLOR);
+    // the last of the light, low over the horizon band: a warm rim on the swells facing it
+    render3D.sunDirection = vec3(Math.sin(SUN_AZIMUTH), .06, -Math.cos(SUN_AZIMUTH));
+    render3D.sunColor = rgb(.54,.33,.21);
+    render3D.ambientColor = rgb(.30,.34,.55);
+    render3D.ambientGroundColor = rgb(.06,.08,.14);
+    buildSea();
+    buildIsland();
+    buildLighthouse();
+    buildCottage();
+    buildLightning();
+    buildClouds();
+    buildBeams();
+    rain = new Rain;
+    buildSpray();
+    buildPost();
+    scheduleStrikes();
+    render3D.camera.fov = CAM_FOV;
+    render3D.camera.far = 2000;
+
+    if (location.search.includes('title')) titleStart = time; // ?title shows the title card at load
+    if (cinematic) titleStart = .5, hudVisible = false;
+    updateCamera();
+}
+
+function gameUpdate()
+{
+    if (keyWasPressed('KeyH')) hudVisible = !hudVisible;
+    if (keyWasPressed('KeyT')) titleStart = time;
+    if (keyWasPressed('Space')) slowMo = !slowMo;
+    if (keyWasPressed('KeyF'))
+    {
+        // into free cam where the camera is, or back onto the path
+        freeCam = !freeCam;
+        const camera = render3D.camera;
+        freeCamPos.set(camera.pos.x, camera.pos.y, camera.pos.z);
+        Object.assign(freeLook, {yaw: camYaw, pitch: 0});
+    }
+    if (keyWasPressed('KeyR')) { ++stormSeed; stormTime = 0; scheduleStrikes(); }
+    if (freeCam) updateFreeCam();
+    else if (mouseWasPressed(0)) clickStrike();
+    stormTime += slowMo ? 1/240 : 1/60;
+    updateCamera();
+    updateLightning();
+    updateBeams();
+    rain.step(slowMo ? 1/240 : 1/60);
+    updateSpray();
+    updatePost();
+}
+
+function gameUpdatePost() {}
+
+///////////////////////////////////////////////////////////////////////////////
+function gameRender() {}
+
+function gameRenderPost()
+{
+    const now = performance.now();
+    if (lastFrameTime)
+        fpsSmooth = lerp(fpsSmooth, 1e3/Math.max(now - lastFrameTime, 1), .05);
+    lastFrameTime = now;
+
+    // title card on T: fades in over a second, holds three, fades out over two
+    const titleAge = time - titleStart;
+    if (titleAge < 6)
+        drawCard(Math.min(titleAge, 1, (6 - titleAge)/2), 'Lighthouse', 'a storm at blue hour in LittleJS');
+
+    // the cinematic's end card fades in and holds to the last frame
+    if (cinematic && time > CINE_END_CARD)
+        drawCard(Math.min(time - CINE_END_CARD, 1), 'LittleJS', 'The tiny fast JavaScript game engine');
+
+    if (!hudVisible) return;
+    const size = Math.round(mainCanvasSize.y/40), y = mainCanvasSize.y - size*1.4;
+    if (freeCam)
+        drawTextScreen('free cam:  WASD move   drag to look   Q/E down/up   Shift faster   F back', vec2(size, size*1.4),
+            size*.8, rgb(1,1,1,.75), 0, BLACK, 'left');
+    const text = 'click for lightning' + (recordMode ? '' : `   ${Math.round(fpsSmooth)} fps`);
+    drawTextScreen(text, vec2(size, y), size, rgb(1,1,1,.75), 0, BLACK, 'left');
+    drawTextScreen('LittleJS', vec2(mainCanvasSize.x - size, y), size, rgb(1,1,1,.75), 0, BLACK, 'right');
+}
+
+// big italic line with a smaller line under it, high in the sky
+function drawCard(alpha, line1, line2)
+{
+    const size = mainCanvasSize.y/9, x = mainCanvasSize.x/2, y = mainCanvasSize.y*.2;
+    const outline = rgb(.05,.05,.12,alpha*.35);
+    drawTextScreen(line1, vec2(x, y), size, rgb(1,.95,.9,alpha*.9), size*.04, outline, 'center', 'Georgia, serif', 'italic');
+    drawTextScreen(line2, vec2(x, y + size*.85), size*.3, rgb(1,.92,.85,alpha*.8), size*.02, outline, 'center', 'Georgia, serif');
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ?record: the engine only steps when told to, so tools/capture.mjs can record frame exact video
+const recordMode = location.search.includes('record');
+let recordReady = false;
+// tools/capture.mjs prints simTime with each shot
+Object.defineProperty(window, 'simTime', {get: () => stormTime});
+setEngineManualStep(recordMode);
+engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost).then(() => recordReady = true);
+</script>

@@ -11,6 +11,7 @@ a { color: #ffb37a; }
 .demo { display: block; padding: 20px 24px; border-radius: 10px; text-decoration: none; color: inherit;
     background: linear-gradient(160deg, #3d2650, #8a4a5c 70%, #e08a5a); }
 .demo:hover { outline: 2px solid #ffb37a; }
+.demo + .demo { margin-top: 16px; }
 .demo h2 { margin: 0 0 4px; font-weight: normal; font-style: italic; }
 .demo p { margin: 0; }
 footer { margin-top: 48px; color: #8a7a99; font-size: 15px; }
@@ -18,6 +19,11 @@ footer { margin-top: 48px; color: #8a7a99; font-size: 15px; }
 </head><body><main>
 <h1>LittleJS Demos</h1>
 <p class=tagline>Showcase demos made with <a href=https://github.com/KilledByAPixel/LittleJS>LittleJS</a>, the tiny fast JavaScript game engine</p>
+
+<a class=demo href=lighthouse/ style="background:linear-gradient(160deg, #1a2a5a, #3a3a7a 60%, #e07a50)">
+    <h2>Lighthouse</h2>
+    <p>A lighthouse on a rocky islet in a blue-hour storm, in LittleJS 3D. Click anywhere to call down lightning.</p>
+</a>
 
 <a class=demo href=murmuration/>
     <h2>Murmuration</h2>
