@@ -12,8 +12,9 @@ check(flicker(-.01) === 0, 'and dark before it starts');
 check(flicker(.1) < flicker(.14), 'it flickers: a second peak after the first dip');
 
 const cine = makeSchedule(seeded(7), true);
-check(cine.length === 3 && cine[0].t === 4 && cine[1].t === 12 && cine[2].t === 20, 'the cinematic strikes at 4, 12 and 20s');
-check(cine[0].kind === 'cloud' && cine[1].kind === 'ground' && cine[2].kind === 'ground' && cine[2].big, 'cloud, ground, then the big one');
+check(JSON.stringify(cine.map(s => s.t)) === '[3.5,11,15,18.5,23]', 'the cinematic strikes at 3.5, 11, 15, 18.5 and 23s');
+check(cine.map(s => s.kind + (s.big ? '!' : '')).join() === 'cloud,ground,cloud,ground!,cloud',
+    'cloud, ground, cloud, the big one, and a last flash in the cloud');
 const live = makeSchedule(seeded(7), false), again = makeSchedule(seeded(7), false);
 const gaps = live.slice(1).map((s, i) => s.t - live[i].t);
 check(live.length > 20, `the live schedule covers a long run (${live.length})`);

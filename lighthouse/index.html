@@ -11,9 +11,9 @@
 // Lighthouse: a lighthouse on a rocky islet in a blue hour storm. The sea heaves, rain streaks through the turning
 // beam, and lightning lights the clouds, the swells and the rocks from where it strikes. Click to call a strike.
 
-// ?cinematic: a hands free 32 second shot for video - title, three strikes, the camera's drift, end card
+// ?cinematic: a hands free 30 second shot for video - title, five strikes, the camera's drift, end card
 const cinematic = location.search.includes('cinematic');
-const CINE_LENGTH = 32, CINE_END_CARD = 27;
+const CINE_LENGTH = 30, CINE_END_CARD = 25.5;
 
 let hudVisible = true, slowMo = false, titleStart = -1e9, fpsSmooth = 60, lastFrameTime = 0, freeCam = false;
 // the storm's own clock: everything that should slow down in slow motion reads it instead of the engine's time
@@ -28,14 +28,14 @@ let stormTime = 0, stormSeed = 1;
 // its distance instead of cutting the corner.
 
 const EYE_MIN = 3;         // never lower than this, or a swell crest would swallow the lens
-const CAM_LOOP = 40;       // the live page's loop, the cinematic's 32 seconds plus the ease home
+const CAM_LOOP = 38;       // the live page's loop, the cinematic's 30 seconds plus the ease home
 const CAM_LEGS = [
-    {t: 0,  pos: [0, 3.5, 68],   target: [0, 10, 0]},
-    {t: 4,  pos: [0, 3.5, 68],   target: [0, 10, 0]},
-    {t: 12, pos: [0, 3.5, 48],   target: [0, 10, 0]},
-    {t: 20, pos: [-22, 4.5, 40], target: [2, 10, 0]},
-    {t: 28, pos: [-10, 7, 60],   target: [0, 11, 0]},
-    {t: 36, pos: [-10, 7, 60],   target: [0, 11, 0]},
+    {t: 0,    pos: [0, 3.5, 68],   target: [0, 10, 0]},
+    {t: 3.5,  pos: [0, 3.5, 68],   target: [0, 10, 0]},
+    {t: 11,   pos: [0, 3.5, 48],   target: [0, 10, 0]},
+    {t: 18.5, pos: [-22, 4.5, 40], target: [2, 10, 0]},
+    {t: 25.5, pos: [-10, 7, 60],   target: [0, 11, 0]},
+    {t: 34,   pos: [-10, 7, 60],   target: [0, 11, 0]},
     {t: CAM_LOOP, pos: [0, 3.5, 68], target: [0, 9, 0]},
 ];
 
@@ -418,15 +418,17 @@ function flicker(age)
     return .8*fade*fade;
 }
 
-// when and where the storm strikes: the cinematic's three set pieces, or a long seeded run for the live page.
+// when and where the storm strikes: the cinematic's five set pieces, or a long seeded run for the live page.
 // Live strikes stay in the half of the sea the camera faces, never nearer the camera's path than 40m
 function makeSchedule(random, cinematic)
 {
     if (cinematic)
         return [
-            {t: 4,  kind: 'cloud',  x: -30, y: CLOUD_BASE_Y, z: -90},
-            {t: 12, kind: 'ground', x: 45,  y: 0, z: -20},
-            {t: 20, kind: 'ground', x: 18,  y: 0, z: -34, big: true},
+            {t: 3.5,  kind: 'cloud',  x: -30, y: CLOUD_BASE_Y, z: -90},
+            {t: 11,   kind: 'ground', x: 45,  y: 0, z: -20},
+            {t: 15,   kind: 'cloud',  x: 35,  y: CLOUD_BASE_Y, z: -60},
+            {t: 18.5, kind: 'ground', x: 18,  y: 0, z: -34, big: true},
+            {t: 23,   kind: 'cloud',  x: -45, y: CLOUD_BASE_Y, z: -100},
         ];
     const strikes = [];
     for (let t = 2 + random()*3; t < 3600; t += STRIKE_GAP_MIN + random()*(STRIKE_GAP_MAX - STRIKE_GAP_MIN))
@@ -825,7 +827,7 @@ function drawClouds()
 // After the big strike the storm closes in: the rain thickens over the last stretch before the end card. The big
 // strike also kicks the picture apart into a chromatic fringe for its brightest frames, as an overexposed lens does.
 
-const CINE_RAIN_START = 20, CINE_RAIN_FULL = 28, CINE_RAIN_MAX = 1.6;
+const CINE_RAIN_START = 18.5, CINE_RAIN_FULL = 25.5, CINE_RAIN_MAX = 1.6;
 
 function cineRainRate(t)
 {
