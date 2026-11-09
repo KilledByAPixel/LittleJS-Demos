@@ -95,6 +95,7 @@ const SEA_COLOR = rgb(.08,.20,.29), FOAM_COLOR = rgb(.78,.83,.85);
 const ROCK_FOAM_RADIUS = 16;                // foam churns this far out from the island's middle
 const FOG_START = 90, FOG_END = 380, FOG_COLOR = rgb(.17,.18,.36);
 const SUN_AZIMUTH = -.6;                    // where the last of the light is, left of the first shot's view
+const AMBIENT_COLOR = rgb(.30,.34,.55), AMBIENT_FLASH = rgb(.22,.25,.42);
 let sea;
 
 // the waves as GLSL constants, written from WAVES so the shader and seaHeightAt can never drift apart
@@ -192,16 +193,49 @@ function buildStormSky()
             for (const e of [rows[j+1], rows[j]])
             {
                 points.push(vec3(Math.sin(a)*Math.cos(e), Math.sin(e), -Math.cos(a)*Math.cos(e)));
-                colors.push(e < 0 ? FOG_COLOR : stormSkyColor(a, e));
+                colors.push(e < 0 ? FOG_COLOR.copy() : stormSkyColor(a, e));
             }
         }
         mesh.addStrip(points, up, undefined, colors);
     }
     mesh.doubleSided = true;
+    mesh.dynamicDraw = true; // a strike repaints it
+    skyMesh = mesh, skyBase = mesh.colors.map(c => c.copy());
     // what the sea reflects: the engine looks a sky's colors up by its mesh, as buildSky registers them, so this
     // dome registers its own, overhead, toward the horizon (the band's warmth averaged in), and below
     render3DSkyColors.set(mesh, [rgb(.16,.18,.42), rgb(.33,.31,.52), FOG_COLOR]);
     return mesh;
+}
+
+// a strike lights the sky round it: every point of the dome brightens by how near it is to the bolt as the camera
+// sees it, plus a little all over, and goes back to its own color when the strike is over
+const SKY_FLASH_COLOR = rgb(.5,.55,.85);
+let skyMesh, skyBase, skyFlashing = false;
+function updateSkyFlash()
+{
+    const camera = render3D.camera.pos, sources = [];
+    for (const strike of strikes)
+    {
+        const f = flicker(stormTime - strike.start)*(strike.big ? 1.3 : 1)*(strike.kind == 'cloud' ? .7 : 1);
+        const mid = strike.main[strike.main.length >> 2], d = mid.subtract(camera).normalize();
+        f > 0 && sources.push({x: d.x, y: d.y, z: d.z, f});
+    }
+    if (!sources.length && !skyFlashing) return;
+    skyFlashing = sources.length > 0;
+    const points = skyMesh.points, colors = skyMesh.colors;
+    for (let i = 0; i < points.length; ++i)
+    {
+        const p = points[i];
+        let k = 0;
+        for (const s of sources)
+        {
+            const d = Math.max(0, p.x*s.x + p.y*s.y + p.z*s.z);
+            k += s.f*(.1 + .9*d**8);
+        }
+        const base = skyBase[i], c = colors[i];
+        c.r = base.r + SKY_FLASH_COLOR.r*k, c.g = base.g + SKY_FLASH_COLOR.g*k, c.b = base.b + SKY_FLASH_COLOR.b*k;
+    }
+    skyMesh.dirty = true;
 }
 
 function buildSea()
@@ -257,7 +291,7 @@ function rockLayout(seed)
 const LANTERN_Y = SHELF_Y + 15.5, TOWER_HEIGHT = SHELF_Y + 19.3; // the middle of the lantern room, and the finial
 const ROCK_COLOR = rgb(.36,.37,.40), TOWER_WHITE = rgb(.92,.92,.95), TOWER_RED = rgb(.75,.18,.15);
 const LANTERN_COLOR = rgb(1,.82,.56), WINDOW_COLOR = rgb(1,.69,.38);
-let islandObject, towerObject, lanternObject, lanternLight, lanternFlare, cottageLight;
+let islandObject, towerObject, lanternObject, lanternLight, cottageLight;
 
 // one mesh of every rock and the mound under the tower, flat shaded and faceted for the clean stylized look
 function buildIsland()
@@ -301,7 +335,6 @@ function buildLighthouse()
     lanternObject = new EngineObject3D(vec3(0, LANTERN_Y, 0), buildCylinder(3, 3, 16, true), undefined, LANTERN_COLOR);
     lanternObject.emissive = 1.6;
     lanternLight = new Light3D(vec3(0, LANTERN_Y, 0), 30, LANTERN_COLOR, 2);
-    lanternFlare = lanternLight.addFlare(undefined, undefined, .2); // faint until the beam swings toward the camera
 }
 
 // the keeper's cottage beside the tower: stone walls, a slate roof and one warm window
@@ -366,36 +399,69 @@ function makeSchedule(random, cinematic)
     return strikes;
 }
 
-// a bolt from a to b: the line split in half four times, each midpoint knocked aside by a share of its segment's
-// length, and one branch forking off partway down
-function boltPoints(a, b, seed)
+// a bolt from a to b: the line split in half six times, each midpoint knocked aside, square to the bolt's way, by a
+// share of its segment's length, and moved along the way only inside its own segment, so the channel wanders and
+// jags but never turns back on itself. Branches fork off it partway down, thinner, and some fork again. A bolt that
+// mostly falls jags sideways; one that runs level across the cloud jags up, down and sideways
+function boltPoints(a, b, seed, big=false)
 {
     let s = (seed*2246822519 >>> 0) || 1;
     const random = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0)/4294967296 - .5; };
-    const split = (points, rounds, rough) =>
+    const split = (points, roughs) =>
     {
-        for (let r = 0; r < rounds; ++r)
+        const first = points[0], last = points.at(-1);
+        const dx = last.x - first.x, dy = last.y - first.y, dz = last.z - first.z;
+        const length = Math.hypot(dx, dy, dz) || 1, falls = Math.abs(dy)/length > .7, h = Math.hypot(dx, dz) || 1;
+        // the way it goes, and the two ways across it the jags go
+        const axis = falls ? [0, Math.sign(dy), 0] : [dx/h, 0, dz/h];
+        const u = falls ? [1, 0, 0] : [-dz/h, 0, dx/h], v = falls ? [0, 0, 1] : [0, 1, 0];
+        for (const rough of roughs)
         {
             const next = [points[0]];
             for (let i = 1; i < points.length; ++i)
             {
-                const p = points[i-1], q = points[i], len = Math.hypot(q.x - p.x, q.y - p.y, q.z - p.z)*rough;
-                next.push({x: (p.x + q.x)/2 + random()*len, y: (p.y + q.y)/2 + random()*len*.5, z: (p.z + q.z)/2 + random()*len}, q);
+                const p = points[i-1], q = points[i], len = Math.hypot(q.x - p.x, q.y - p.y, q.z - p.z);
+                const span = (q.x - p.x)*axis[0] + (q.y - p.y)*axis[1] + (q.z - p.z)*axis[2];
+                const ou = random()*len*rough, ov = random()*len*rough, along = random()*.3*span;
+                next.push({x: (p.x + q.x)/2 + u[0]*ou + v[0]*ov + axis[0]*along,
+                    y: (p.y + q.y)/2 + u[1]*ou + v[1]*ov + axis[1]*along,
+                    z: (p.z + q.z)/2 + u[2]*ou + v[2]*ov + axis[2]*along}, q);
             }
             points = next;
         }
         return points;
     };
-    const main = split([{...a}, {...b}], 4, .55);
-    const from = main[7 + (random() + .5)*4 | 0], reach = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z)*.35;
-    const end = {x: from.x + (random()*1.2 + Math.sign(random() || 1)*.4)*reach, y: from.y - reach*(.6 + random()*.4),
-        z: from.z + random()*reach};
-    return {main, branch: split([{...from}, end], 3, .5)};
+    const main = split([{...a}, {...b}], [.3, .4, .45, .45, .45, .45]);
+    const total = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z), branches = [];
+    // a branch: from a point on its parent, on down and out the side, a share of the bolt's length
+    const fork = (parent, at, reach, weight) =>
+    {
+        const from = parent[at], ahead = parent[Math.min(at + 4, parent.length - 1)];
+        const len = Math.hypot(ahead.x - from.x, ahead.y - from.y, ahead.z - from.z) || 1;
+        const side = random()*2*Math.PI, kick = .7 + (random() + .5)*.6;
+        let x = (ahead.x - from.x)/len + Math.cos(side)*kick, y = Math.min((ahead.y - from.y)/len, 0) - .6;
+        let z = (ahead.z - from.z)/len + Math.sin(side)*kick;
+        const d = Math.hypot(x, y, z);
+        const end = {x: from.x + x/d*reach, y: from.y + y/d*reach, z: from.z + z/d*reach};
+        const points = split([{...from}, end], [.45, .45, .45, .45]);
+        branches.push({points, weight});
+        return points;
+    };
+    const count = (big ? 6 : 3) + ((random() + .5)*(big ? 2.99 : 2.99) | 0);
+    for (let i = 0; i < count; ++i)
+    {
+        const share = .08 + (random() + .5)*.62, at = Math.round(share*(main.length - 1));
+        const points = fork(main, at, total*(.15 + (random() + .5)*.2)*(1 - share*.5), .35 + (random() + .5)*.25);
+        if (random() < -.1 && branches.length < 8)
+            fork(points, Math.round(points.length*(.3 + (random() + .5)*.3)), total*.08, .2);
+    }
+    return {main, branches: branches.slice(0, 8)};
 }
 // LIGHTNING END
 
 const LIGHTNING_POOL = 6, LIGHTNING_COLOR = rgb(.87,.91,1);
 const STRIKE_RADIUS = 150, STRIKE_INTENSITY = 4, BIG_STRIKE_INTENSITY = 6;
+const CLOUD_LIGHT_RADIUS = 70, CLOUD_LIGHT_SCALE = .45; // the lights inside the deck: shorter reach, dimmer
 const lightningLights = [], strikes = [];
 let strikeSchedule = [], nextStrike = 0, stormRandom, strikeCount = 0;
 
@@ -404,7 +470,7 @@ function buildLightning()
 {
     for (let i = 0; i < LIGHTNING_POOL; ++i)
         lightningLights.push(new Light3D(vec3(), STRIKE_RADIUS, LIGHTNING_COLOR, 0));
-    render3D.onRenderTransparent = () => { drawClouds(); drawBolts(); };
+    render3D.onRenderTransparent = () => { drawClouds(); drawRipples(); drawBolts(); drawLanternGlow(); };
 }
 
 // a new storm from the seed: R steps the seed, so the live page shows another storm
@@ -436,19 +502,23 @@ function startStrike(kind, pos, big=false, at=stormTime)
         const angle = (seed*1.7) % (2*PI), span = 50 + (seed*13.1) % 30;
         const a = {x: pos.x - Math.cos(angle)*span/2, y: pos.y, z: pos.z - Math.sin(angle)*span/2};
         const b = {x: pos.x + Math.cos(angle)*span/2, y: pos.y - 4, z: pos.z + Math.sin(angle)*span/2};
-        bolt = boltPoints(a, b, seed);
+        bolt = boltPoints(a, b, seed, big);
         lights.forEach((l, i) => l.pos3D = vec3(a.x + (b.x - a.x)*(i + .5)/count, pos.y + 6, a.z + (b.z - a.z)*(i + .5)/count));
+        lights.forEach(l => l.inCloud = true);
     }
     else
     {
         // from the cloud base straight above, down to the water; one light just over the strike point, the rest up
         // in the cloud it came out of
         const top = {x: pos.x + ((seed*3.3) % 20) - 10, y: CLOUD_BASE_Y, z: pos.z + ((seed*5.7) % 20) - 10};
-        bolt = boltPoints(top, {x: pos.x, y: pos.y, z: pos.z}, seed);
+        bolt = boltPoints(top, {x: pos.x, y: pos.y, z: pos.z}, seed, big);
+        if (Math.hypot(pos.x, pos.z) > MOUND_RADIUS) makeSplash(pos, big); // on the open sea, not the rocks
         lights.forEach((l, i) => l.pos3D = i ? vec3(top.x + (i - 1.5)*15, CLOUD_BASE_Y + 6, top.z) : vec3(pos.x, pos.y + 4, pos.z));
+        lights.forEach((l, i) => l.inCloud = i > 0);
     }
     const toVec = list => list.map(p => vec3(p.x, p.y, p.z));
-    strikes.push({kind, start: at, big, lights, main: toVec(bolt.main), branch: toVec(bolt.branch)});
+    strikes.push({kind, start: at, big, lights, main: toVec(bolt.main),
+        branches: bolt.branches.map(b => ({points: toVec(b.points), weight: b.weight}))});
 }
 
 // each frame: start what the schedule says is due, and drive every live strike's lights by its flicker
@@ -459,43 +529,101 @@ function updateLightning()
         const s = strikeSchedule[nextStrike++], p = strikeTarget(s.kind, s.x, s.y, s.z, time);
         startStrike(s.kind, vec3(p.x, p.y, p.z), s.big, s.t);
     }
+    let flash = 0;
     for (const strike of [...strikes])
     {
         const age = stormTime - strike.start;
         if (age >= STRIKE_LENGTH) { endStrike(strike); continue; }
         const f = flicker(age);
+        flash += f*(strike.big ? 1.3 : 1)*(strike.kind == 'cloud' ? .6 : 1);
         for (const light of strike.lights)
-            light.intensity = f*(strike.big ? BIG_STRIKE_INTENSITY : STRIKE_INTENSITY);
+        {
+            light.radius = light.inCloud ? CLOUD_LIGHT_RADIUS : STRIKE_RADIUS;
+            light.intensity = f*(strike.big ? BIG_STRIKE_INTENSITY : STRIKE_INTENSITY)*(light.inCloud ? CLOUD_LIGHT_SCALE : 1);
+            light.glow = light.inCloud ? 0 : 14*f;
+        }
     }
+    flash = Math.min(flash, 1.5);
+    render3D.ambientColor = rgb(AMBIENT_COLOR.r + AMBIENT_FLASH.r*flash, AMBIENT_COLOR.g + AMBIENT_FLASH.g*flash,
+        AMBIENT_COLOR.b + AMBIENT_FLASH.b*flash);
+    updateSkyFlash();
 }
 
-// the bolts, in the transparent stage: a wide faint glow round a thin white core, added onto the scene
+// the bolts, in the transparent stage: a wide faint haze, a glow and a white core, all added onto the scene. The main
+// channel holds through the restrike; the branches thin to their tips and are gone after the first stroke, as a
+// real bolt's are. Where one meets the sea its light's own glow flares on the water
 function drawBolts()
 {
     if (!strikes.length) return;
     render3D.additive = true;
     for (const strike of strikes)
     {
-        const f = flicker(stormTime - strike.start);
+        const age = stormTime - strike.start, f = flicker(age);
         if (f <= 0) continue;
-        const width = strike.big ? 1.6 : 1;
-        for (const [points, scale] of [[strike.main, 1], [strike.branch, .6]])
+        const width = strike.big ? 1.5 : 1, branchFade = f*Math.max(0, 1 - Math.max(0, age - .1)/.12);
+        const draw = (points, w, alpha, taper) =>
         {
-            render3D.drawRibbon(points, 3*width*scale, undefined, rgb(.5,.6,1,.35*f));
-            render3D.drawRibbon(points, .5*width*scale, undefined, rgb(1,1,1,f));
-        }
+            const widths = taper ? points.map((p, i) => 1 - .85*i/(points.length - 1)) : undefined;
+            for (const [scale, color] of [[7, rgb(.45,.5,1,.06*alpha)], [2.2, rgb(.6,.7,1,.3*alpha)], [.4, rgb(1,1,1,alpha)]])
+                render3D.drawRibbon(points, widths ? widths.map(k => k*w*scale) : w*scale, undefined, color);
+        };
+        draw(strike.main, width, f, false);
+        if (branchFade > 0)
+            for (const branch of strike.branches)
+                draw(branch.points, width*branch.weight, branchFade*(.5 + branch.weight), true);
     }
     render3D.additive = false;
+}
+
+// a bolt into the sea: a crown of droplets thrown up and out, a column in the middle, a cloud of steam and spray
+// that drifts off downwind, and a ring of foam spreading on the swell
+const ripples = [];
+function makeSplash(pos, big)
+{
+    const k = big ? 1.4 : 1, white = rgb(1,1,1,.95), blue = rgb(.85,.92,1,.9), clear = rgb(.9,.95,1,0);
+    const at = vec3(pos.x, pos.y, pos.z);
+    const emit = (rate, cone, size0, size1, life, speed, gravity, damping, colorA, colorB, seconds=.1) =>
+    {
+        const e = new ParticleEmitter3D(at, 1.5*k, seconds, rate, cone, puffTile, colorA, colorB, clear, clear,
+            life, size0, size1, speed, damping, gravity, .3, .4);
+        e.emissive = .4;
+        return e;
+    };
+    const crown = emit(1800*k, PI/3, .5, .3, 1.5, .34*k, -.009, .99, white, blue);
+    crown.trailTime = .06;
+    const column = emit(500*k, PI/18, .8, .4, 1.6, .5*k, -.009, .99, white, blue);
+    column.trailTime = .05;
+    const mist = emit(180*k, PI/2, 5*k, 15*k, 2.8, .1, .0007, .965, rgb(1,1,1,.4), rgb(.8,.85,.95,.3), .15);
+    mist.roundLighting = true, mist.gravityScale = 1;
+    ripples.push({x: pos.x, z: pos.z, start: time, k});
+}
+
+// the foam rings, drawn as puffs round a widening circle on the moving water
+function drawRipples()
+{
+    for (const r of [...ripples])
+    {
+        const age = time - r.start, p = age/3;
+        if (p >= 1) { ripples.splice(ripples.indexOf(r), 1); continue; }
+        const radius = (2 + 15*(1 - (1 - p)**2))*r.k, count = 36, fade = (1 - p)**1.5;
+        for (let i = 0; i < count; ++i)
+        {
+            const a = i/count*2*PI + r.x, x = r.x + Math.cos(a)*radius, z = r.z + Math.sin(a)*radius;
+            render3D.drawBillboard(vec3(x, seaHeightAt(x, z, time) + .3, z), vec2(2.2 + 2*p, 1.2 + p),
+                puffTile, rgb(.9,.95,1,.75*fade));
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // CLOUDS BEGIN - where the cloud puffs are and how they drift, plain math only so node can test it
 //
-// Three layers of big soft puffs low over the sea, the lowest at the base the lightning comes out of, each drifting
-// downwind at its own pace and wrapping round inside a box centered on the island, so the sky never empties.
+// The storm's deck: banks of big lumpy puffs in three layers low over the sea, the lowest at the base the lightning
+// comes out of, with the evening sky showing between the banks. Each layer drifts downwind at its own pace and wraps
+// round inside a box centered on the island, so the sky never empties.
 
-const CLOUD_COUNT = 48, CLOUD_BOX = 360;
-const CLOUD_LAYERS = [CLOUD_BASE_Y, CLOUD_BASE_Y + 12, CLOUD_BASE_Y + 24];
+const CLOUD_BOX = 440, CLOUD_BANKS = 22, CLOUD_VARIANTS = 4;
+const CLOUD_LAYERS = [CLOUD_BASE_Y, CLOUD_BASE_Y + 10, CLOUD_BASE_Y + 21];
 const CLOUD_SPEEDS = [1.5, 2.2, 3];   // meters a second, the higher layers faster
 
 function cloudLayout(seed)
@@ -503,12 +631,19 @@ function cloudLayout(seed)
     let s = (seed*2654435761 >>> 0) || 1;
     const random = (a=0, b=1) => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return a + (b - a)*(s >>> 0)/4294967296; };
     const clouds = [];
-    for (let i = 0; i < CLOUD_COUNT; ++i)
+    for (let bank = 0; bank < CLOUD_BANKS; ++bank)
     {
-        const layer = i % CLOUD_LAYERS.length;
-        clouds.push({layer, x: random(-.5, .5)*CLOUD_BOX, y: CLOUD_LAYERS[layer] + random(-2.5, 2.5),
-            z: random(-.5, .5)*CLOUD_BOX, size: random(60, 110), squash: random(.45, .65), shade: random(.85, 1.1),
-            alpha: random(.55, .8), angle: random(-.2, .2)});
+        // a bank is a loose row of puffs across the wind, big in the middle and smaller toward its ends
+        const layer = bank % CLOUD_LAYERS.length, x = random(-.5, .5)*CLOUD_BOX, z = random(-.5, .5)*CLOUD_BOX;
+        const puffs = 4 + (random()*4 | 0), across = random(-.4, .4), shade = random(.85, 1.1);
+        for (let i = 0; i < puffs; ++i)
+        {
+            const along = (i/(puffs - 1) - .5)*random(60, 100), middle = 1 - Math.abs(i/(puffs - 1) - .5);
+            clouds.push({bank, layer, variant: (bank + i*3) % CLOUD_VARIANTS,
+                x: x + Math.cos(across)*along + random(-8, 8), y: CLOUD_LAYERS[layer] + random(-2.5, 2.5) + middle*1.5,
+                z: z + Math.sin(across)*along + random(-12, 12), size: random(50, 70) + middle*40,
+                shade: shade*random(.92, 1.05), alpha: random(.8, .95), mirror: random() < .5});
+        }
     }
     return clouds;
 }
@@ -522,38 +657,121 @@ function cloudPosAt(cloud, t)
 // CLOUDS END
 
 // colors for lit billboards: each is lit by the ambient, the low warm sun and any lightning near it, so the color
-// here is brighter than it shows; the higher layers a little darker and bluer
-const CLOUD_COLORS = [rgb(.62,.62,.82), rgb(.52,.54,.76), rgb(.42,.45,.68)];
-let clouds, cloudTile;
+// here is darker than it shows; the higher layers a little darker and bluer. The shapes carry their own light baked
+// in, bright lumpy tops and a dark flat underside, so they read as clouds before the lightning finds them
+const CLOUD_COLORS = [rgb(.50,.54,.78), rgb(.46,.50,.76), rgb(.42,.46,.72)];
+const CLOUD_EMISSIVE = .3; // the share of a puff's color it keeps unlit, so the dark side never goes muddy
+const CLOUD_CELL = vec2(256, 128); // each baked shape's cell in the cloud texture, side by side
+let clouds, cloudTiles = [], puffTile, glowTile;
 
-// a soft puff drawn once into a canvas: a few overlapping round glows, white fading to clear
-function buildClouds()
+// a soft round puff, white fading to clear, for the spray and the mist
+function makePuffTexture()
+{
+    const size = 64, canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const context = canvas.getContext('2d');
+    const g = context.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(.45, 'rgba(255,255,255,.55)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    context.fillStyle = g;
+    context.fillRect(0, 0, size, size);
+    return new TextureInfo(canvas);
+}
+
+// a light's soft glow, for the lamp and where a bolt meets the sea
+function makeGlowTexture()
 {
     const size = 128, canvas = document.createElement('canvas');
     canvas.width = canvas.height = size;
     const context = canvas.getContext('2d');
-    for (const [x, y, r] of [[.5, .55, .42], [.32, .6, .28], [.68, .58, .3], [.45, .42, .28], [.6, .45, .24]])
+    const g = context.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+    g.addColorStop(0, 'rgba(255,255,255,1)');
+    g.addColorStop(.12, 'rgba(255,255,255,.6)');
+    g.addColorStop(.4, 'rgba(255,255,255,.12)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    context.fillStyle = g;
+    context.fillRect(0, 0, size, size);
+    return new TextureInfo(canvas);
+}
+
+// the cloud shapes, drawn once side by side: each a heap of round lumps on a flat base, every lump lit from above
+// so its top is bright and its foot dim, drawn top first so the lower lumps stand out against the shade above them,
+// then the whole underside pulled down toward the storm's blue gray
+function buildClouds()
+{
+    const w = CLOUD_CELL.x, h = CLOUD_CELL.y, canvas = document.createElement('canvas');
+    canvas.width = w*CLOUD_VARIANTS, canvas.height = h;
+    const context = canvas.getContext('2d'), random = new RandomGenerator(7);
+    for (let v = 0; v < CLOUD_VARIANTS; ++v)
     {
-        const g = context.createRadialGradient(x*size, y*size, 0, x*size, y*size, r*size);
-        g.addColorStop(0, 'rgba(255,255,255,.55)');
-        g.addColorStop(.6, 'rgba(255,255,255,.25)');
-        g.addColorStop(1, 'rgba(255,255,255,0)');
-        context.fillStyle = g;
-        context.fillRect(0, 0, size, size);
+        const left = v*w, base = h*.8, lumps = [];
+        context.save();
+        context.beginPath();
+        context.rect(left, 0, w, h);
+        context.clip();
+        // the lumps: big ones in the middle, smaller toward the sides, sitting on the base line
+        const count = 26 + v*4;
+        for (let i = 0; i < count; ++i)
+        {
+            const across = random.float(-1, 1), middle = 1 - Math.abs(across);
+            const r = h*(.1 + .17*middle*random.float(.6, 1.2));
+            const x = left + w/2 + across*(w/2 - r - 4), y = base - r*random.float(.2, .9) - middle*h*.22*random.float(.4, 1);
+            lumps.push({x, y, r});
+        }
+        lumps.sort((a, b) => (a.y - a.r) - (b.y - b.r));
+        for (const {x, y, r} of lumps)
+        {
+            const g = context.createRadialGradient(x - r*.2, y - r*.5, r*.05, x, y + r*.1, r);
+            g.addColorStop(0, 'rgba(255,255,255,1)');
+            g.addColorStop(.5, 'rgba(214,216,230,1)');
+            g.addColorStop(.85, 'rgba(170,174,196,.85)');
+            g.addColorStop(1, 'rgba(170,174,196,0)');
+            context.fillStyle = g;
+            context.beginPath();
+            context.arc(x, y, r, 0, 2*PI);
+            context.fill();
+        }
+        // the shade underneath, and the base melting into the air instead of a hard line
+        context.globalCompositeOperation = 'source-atop';
+        const shade = context.createLinearGradient(0, h*.25, 0, h);
+        shade.addColorStop(0, 'rgba(40,44,74,0)');
+        shade.addColorStop(.55, 'rgba(40,44,74,.5)');
+        shade.addColorStop(1, 'rgba(28,30,54,.85)');
+        context.fillStyle = shade;
+        context.fillRect(left, 0, w, h);
+        context.globalCompositeOperation = 'destination-out';
+        const fade = context.createLinearGradient(0, base - h*.1, 0, base + h*.12);
+        fade.addColorStop(0, 'rgba(0,0,0,0)');
+        fade.addColorStop(1, 'rgba(0,0,0,1)');
+        context.fillStyle = fade;
+        context.fillRect(left, 0, w, h);
+        context.restore();
     }
-    cloudTile = new TextureInfo(canvas);
+    const texture = new TextureInfo(canvas);
+    for (let v = 0; v < CLOUD_VARIANTS; ++v)
+        cloudTiles.push(new TileInfo(vec2(v*w, 0), CLOUD_CELL, texture, 0, 1));
+    puffTile = makePuffTexture();
+    glowTile = makeGlowTexture();
     clouds = cloudLayout(stormSeed);
 }
 
-// in the transparent stage, sorted far to near by the engine with the rest
+// in the transparent stage, sorted far to near by the engine with the rest; lit, so a strike lights the puffs
+// round it. The ones toward the last light take its warmth
 function drawClouds()
 {
+    const camera = render3D.camera.pos;
+    render3D.emissive = CLOUD_EMISSIVE;
     for (const c of clouds)
     {
         const p = cloudPosAt(c, stormTime), base = CLOUD_COLORS[c.layer];
-        render3D.drawBillboard(vec3(p.x, p.y, p.z), vec2(c.size, c.size*c.squash), cloudTile,
-            rgb(base.r*c.shade, base.g*c.shade, base.b*c.shade, c.alpha), c.angle);
+        let da = Math.atan2(p.x - camera.x, -(p.z - camera.z)) - SUN_AZIMUTH;
+        da = Math.atan2(Math.sin(da), Math.cos(da));
+        const warm = Math.max(0, 1 - Math.abs(da)/1.2)**2*.3;
+        const color = rgb(base.r*c.shade*(1 + warm*.7), base.g*c.shade*(1 + warm*.2), base.b*c.shade*(1 - warm*.2), c.alpha);
+        render3D.drawBillboard(vec3(p.x, p.y, p.z), vec2(c.size*(c.mirror ? -1 : 1), c.size/2), cloudTiles[c.variant], color);
     }
+    render3D.emissive = 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -633,8 +851,7 @@ const BEAM_COLOR = rgb(1,.89,.66);
 const RAIN_COUNT = 3000;                      // streaks in the box, raised by the cinematic's rain rate
 const RAIN_MAX = Math.ceil(RAIN_COUNT*CINE_RAIN_MAX);
 const RAIN_CLEAR = 6;                         // drops nearer the lens than this are hidden, or they'd fill the frame as bars
-const SPRAY_HEIGHT = .9;                      // a swell higher than this at a windward rock throws spray
-let beamYaw = 0, beams = [], rain, sprays = [];
+let beamYaw = 0, beams = [], rain, lanternGlow = 0;
 
 // the visible beam: brightest along its middle and at the lamp, fading toward its far end and its edges as a lit
 // haze would, so its sides never show as a hard cone
@@ -661,7 +878,7 @@ function buildBeams()
     }
 }
 
-// how squarely a beam faces the camera, 0 to 1: the lamp's flare swells as one sweeps across the lens
+// how squarely a beam faces the camera, 0 to 1: the lamp's glow swells as one sweeps across the lens
 function beamStrength()
 {
     const camera = render3D.camera.pos, dx = camera.x, dy = camera.y - LANTERN_Y, dz = camera.z;
@@ -672,12 +889,21 @@ function beamStrength()
     return smoothStep(percent(best, .93, 1));
 }
 
+// the lamp seen through the rain: a soft halo always, flaring wide as a beam sweeps across the lens
+function drawLanternGlow()
+{
+    render3D.additive = true;
+    const size = 9 + 30*lanternGlow;
+    render3D.drawBillboard(vec3(0, LANTERN_Y, 0), vec2(size), glowTile, rgb(1,.85,.6,.35 + .5*lanternGlow));
+    render3D.additive = false;
+}
+
 function updateBeams()
 {
     beamYaw = beamYawAt(stormTime);
     // laid on its side along -Z, then turned to face its way
     beams.forEach((beam, i) => beam.rotation3D = vec3(-PI/2, beamYaw + i*PI, 0));
-    lanternFlare.intensity = .2 + 1.8*beamStrength();
+    lanternGlow = beamStrength();
 }
 
 // the rain: thin streaks, lit, so the lightning brightens them, and brighter still inside the beam
@@ -728,25 +954,50 @@ class Rain extends InstancedMesh3D
     }
 }
 
-// spray on the windward rocks: a burst each time a big swell reaches one
+// spray on the windward rocks: each time a swell climbs past one, it bursts up the rock's face and over it downwind,
+// a sheet of droplets streaking as they fall, a cloud of spray the wind carries off, and foam churning at its foot.
+// The wind is the particles' share of the world's gravity, set sideways, as nothing else here has a mass
+const SPRAY_ROCKS = 6, SPRAY_LEAN = .5; // how many of the upwind boulders, and how far the burst leans downwind
+let sprayRocks = [];
 function buildSpray()
 {
-    const windward = rockLayout(1).filter(r => r.kind == 'boulder')
-        .sort((a, b) => (a.x*WIND_DIR[0] + a.z*WIND_DIR[1]) - (b.x*WIND_DIR[0] + b.z*WIND_DIR[1])).slice(0, 4);
-    for (const r of windward)
+    render3D.gravity = vec3(WIND_DIR[0]*.0016, 0, WIND_DIR[1]*.0016);
+    const upwind = r => r.x*WIND_DIR[0] + r.z*WIND_DIR[1];
+    sprayRocks = rockLayout(1).filter(r => r.kind == 'boulder').sort((a, b) => upwind(a) - upwind(b)).slice(0, SPRAY_ROCKS)
+        .map((rock, i) => ({rock, level: .35 + .12*i, last: 0, lastBurst: -9,
+            face: vec3(rock.x - WIND_DIR[0]*rock.sx*.4, 0, rock.z - WIND_DIR[1]*rock.sz*.4)}));
+}
+
+function sprayBurst(spray, rise)
+{
+    const k = clamp(rise/1.6, .6, 1.5), at = vec3(spray.face.x, spray.level, spray.face.z);
+    const lean = vec3(SPRAY_LEAN, Math.atan2(WIND_DIR[0], WIND_DIR[1]), 0), clear = rgb(.9,.95,1,0);
+    const emit = (size, seconds, rate, cone, colorA, colorB, life, size0, size1, speed, damping, gravity) =>
     {
-        const spray = new ParticleEmitter3D(vec3(r.x, .6, r.z), 2.5, 0, 0, PI/5, cloudTile,
-            rgb(1,1,1,.8), rgb(.85,.9,.95,.6), rgb(1,1,1,0), rgb(.9,.95,1,0), 1, .5, 2, .13, .985, -.0028, .3, .35);
-        spray.rock = r;
-        sprays.push(spray);
-    }
+        const e = new ParticleEmitter3D(at, size, seconds, rate, cone, puffTile, colorA, colorB, clear, clear,
+            life, size0, size1, speed, damping, gravity, .3, .4);
+        e.rotation3D = lean;
+        e.emissive = .35;
+        return e;
+    };
+    const sheet = emit(vec3(3, .5, 3), .14, 900*k, PI/6, rgb(1,1,1,.95), rgb(.85,.92,1,.9), 1.3, .4, .22, .27*k, .99, -.008);
+    sheet.trailTime = .05, sheet.gravityScale = .5;
+    const mist = emit(3, .2, 80*k, PI/3, rgb(1,1,1,.35), rgb(.85,.9,1,.3), 2.4, 2.5*k, 9*k, .09*k, .965, .0005);
+    mist.roundLighting = true, mist.gravityScale = 1;
+    const foam = emit(vec3(4, .3, 4), .15, 90*k, PI/2.2, rgb(1,1,1,.8), rgb(.9,.95,1,.7), 1.4, 1.5, 4, .05, .95, -.002);
+    foam.gravityScale = .3;
 }
 
 function updateSpray()
 {
     // engine time, as the sea shader's waves run on it
-    for (const spray of sprays)
-        spray.emitRate = seaHeightAt(spray.rock.x, spray.rock.z, time) > SPRAY_HEIGHT ? 140 : 0;
+    for (const spray of sprayRocks)
+    {
+        const h = seaHeightAt(spray.face.x, spray.face.z, time), rise = (h - spray.last)*60;
+        if (h > spray.level && spray.last <= spray.level && rise > .3 && time - spray.lastBurst > 1.2)
+            sprayBurst(spray, rise), spray.lastBurst = time;
+        spray.last = h;
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -862,7 +1113,7 @@ function gameInit()
     // the last of the light, low over the horizon band: a warm rim on the swells facing it
     render3D.sunDirection = vec3(Math.sin(SUN_AZIMUTH), .06, -Math.cos(SUN_AZIMUTH));
     render3D.sunColor = rgb(.54,.33,.21);
-    render3D.ambientColor = rgb(.30,.34,.55);
+    render3D.ambientColor = AMBIENT_COLOR.copy();
     render3D.ambientGroundColor = rgb(.06,.08,.14);
     buildSea();
     buildIsland();

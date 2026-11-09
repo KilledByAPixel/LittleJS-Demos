@@ -4,6 +4,9 @@
 //       real time screenshots of the running page, shot0.png, shot1.png...
 //       MURM_EVAL=expr prints that page expression with each shot, MURM_PAGE=file.html loads another page,
 //       MURM_BEFORE=expr runs before each shot
+//   node capture.mjs frames <outDir> [query] <t1,t2,...> [width] [height]
+//       frame exact stills at those storm times: the page runs with ?record and is stepped to each,
+//       t12.05.png...; MURM_BEFORE=expr runs once after load, before the first step
 //   node capture.mjs record <out.mp4> [query] [seconds] [width] [height]
 //       a frame exact 60fps video: the page runs with ?record (engine manual step),
 //       each frame is stepped, screenshot and piped into ffmpeg
@@ -20,7 +23,7 @@ const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const FFMPEG = 'C:/Users/frank/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.1.2-full_build/bin/ffmpeg.exe';
 const PROFILE_TAG = 'lighthousecap-profile';
 const profileDir = path.join(process.env.TEMP, PROFILE_TAG);
-const PORT = 9333;
+const PORT = +(process.env.CAP_PORT || 9334); // Murmuration's tool uses 9333, so both can run at once
 
 const [mode, out, query = '', ...rest] = process.argv.slice(2);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -49,14 +52,14 @@ process.on('exit', cleanup);
 process.on('SIGINT', () => process.exit(1));
 
 // hard limit, so a stuck page never leaves a browser running
-const limitMinutes = mode == 'record' ? 60 : 5;
+const limitMinutes = mode == 'record' ? 60 : 10;
 setTimeout(() => { console.error('hard time limit hit'); process.exit(2); }, limitMinutes*60e3).unref();
 
 async function main()
 {
     sweep();
-    const width = +(mode == 'record' ? rest[1] : rest[2]) || 1920;
-    const height = +(mode == 'record' ? rest[2] : rest[3]) || 1080;
+    const width = +(mode == 'shots' ? rest[2] : rest[1]) || 1920;
+    const height = +(mode == 'shots' ? rest[3] : rest[2]) || 1080;
     edge = spawn(EDGE, ['--headless=new', `--remote-debugging-port=${PORT}`, `--user-data-dir=${profileDir}`,
         '--mute-audio', '--hide-scrollbars', `--window-size=${width},${height}`,
         '--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=d3d11', 'about:blank'], {stdio:'ignore'});
@@ -112,7 +115,7 @@ async function main()
 
     const page = pathToFileURL(path.join(here, '../' + (process.env.MURM_PAGE || 'index.html'))).href;
     const loaded = new Promise(r => listeners.push(m => m.method == 'Page.loadEventFired' && r()));
-    await send('Page.navigate', {url: page + (mode == 'record' ? (query ? query + '&record' : '?record') : query)});
+    await send('Page.navigate', {url: page + (mode != 'shots' ? (query ? query + '&record' : '?record') : query)});
     await loaded;
     await sleep(500);
     console.log('renderer:', await evaluate(`(() => { const gl = document.createElement('canvas').getContext('webgl2');
@@ -156,6 +159,24 @@ async function main()
                 console.log('  ' + JSON.stringify(await evaluate(process.env.MURM_EVAL)));
         }
     }
+    else if (mode == 'frames')
+    {
+        const times = rest[0].split(',').map(Number).sort((a, b) => a - b);
+        fs.mkdirSync(out, {recursive: true});
+        await evaluate('new Promise(r => { const wait = () => recordReady ? r() : setTimeout(wait, 50); wait(); })');
+        if (process.env.MURM_BEFORE) await evaluate(process.env.MURM_BEFORE);
+        let frame = 0;
+        for (const t of times)
+        {
+            const target = Math.max(1, Math.round(t*60));
+            for (; frame < target; frame += Math.min(600, target - frame))
+                await evaluate(`engineStep(${Math.min(600, target - frame)})`);
+            const shot = await send('Page.captureScreenshot', {format: 'png'});
+            fs.writeFileSync(path.join(out, `t${t}.png`), Buffer.from(shot.data, 'base64'));
+            if (process.env.MURM_EVAL) console.log(`t${t}: ` + JSON.stringify(await evaluate(process.env.MURM_EVAL)));
+        }
+        console.log(`wrote ${times.length} frames to ${out}`);
+    }
     else if (mode == 'record')
     {
         const seconds = +rest[0] || 20, frames = Math.round(seconds*60);
@@ -181,7 +202,7 @@ async function main()
         console.log(`wrote ${out}: ${frames} frames in ${((Date.now() - start)/1e3).toFixed(0)}s`);
     }
     else
-        throw new Error('mode is shots or record');
+        throw new Error('mode is shots, frames or record');
     ws.close();
 }
 

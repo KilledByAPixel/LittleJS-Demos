@@ -16,9 +16,27 @@ export function loadBlock(name, globals = {})
     const sandbox = {Math, Float32Array, Uint32Array, ...globals};
     vm.createContext(sandbox);
     // top level let/const stay in the script's scope, so the block hands back what it declared through a getter
-    const names = [...html.slice(a, b).matchAll(/^(?:function|const|let|class)\s+([A-Za-z_$][\w$]*)/gm)].map(m => m[1]);
-    const extra = [...html.slice(a, b).matchAll(/^(?:const|let)\s+[A-Za-z_$][\w$]*\s*=[^;]*?,\s*([A-Za-z_$][\w$]*)\s*=/gm)].map(m => m[1]);
-    vm.runInContext(html.slice(a, b) + `\n;globalThis.__block = {${[...new Set([...names, ...extra])].join(',')}};`, sandbox);
+    const block = html.slice(a, b);
+    const names = [...block.matchAll(/^(?:function|class)\s+([A-Za-z_$][\w$]*)/gm)].map(m => m[1]);
+    // every name a top level const or let declares, its declarators split on the commas outside brackets
+    for (const m of block.matchAll(/^(?:const|let)\s+([^;]*)/gm))
+    {
+        const text = m[1];
+        let depth = 0, start = 0;
+        for (let i = 0; i <= text.length; ++i)
+        {
+            const c = text[i];
+            if (c === '(' || c === '[' || c === '{') ++depth;
+            else if (c === ')' || c === ']' || c === '}') --depth;
+            else if (i === text.length || c === ',' && !depth)
+            {
+                const name = text.slice(start, i).match(/^\s*([A-Za-z_$][\w$]*)\s*(=|$)/);
+                name && names.push(name[1]);
+                start = i + 1;
+            }
+        }
+    }
+    vm.runInContext(block + `\n;globalThis.__block = {${[...new Set(names)].join(',')}};`, sandbox);
     return sandbox.__block;
 }
 
