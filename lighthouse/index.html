@@ -91,7 +91,7 @@ function seaHeightAt(x, z, t)
 // SEA END
 
 const SEA_SIZE = 1000, SEA_SEGMENTS = 320;  // meters across and cells a side, about 3m a cell
-const SEA_COLOR = rgb(.08,.20,.29), FOAM_COLOR = rgb(.78,.83,.85);
+const SEA_COLOR = rgb(.06,.19,.28), FOAM_COLOR = rgb(.78,.83,.85);
 const ROCK_FOAM_RADIUS = 16;                // foam churns this far out from the island's middle
 const FOG_START = 90, FOG_END = 380, FOG_COLOR = rgb(.17,.18,.36);
 const SUN_AZIMUTH = -.6;                    // where the last of the light is, left of the first shot's view
@@ -126,6 +126,7 @@ vec2 seaSlope(vec2 p, int first, int last)
 
 const SEA_SHADER = new Shader(`${SEA_GLSL_COMMON}
 const vec3 SEA = ${glslVec3(SEA_COLOR)}, FOAM = ${glslVec3(FOAM_COLOR)};
+const vec2 WIND = vec2(${WIND_DIR[0].toFixed(4)}, ${WIND_DIR[1].toFixed(4)});
 const float CREST = ${(WAVES.slice(0, SEA_DISPLACED).reduce((s, w) => s + w.amp, 0)).toFixed(4)};
 void mainImage(out vec4 c, vec2 uv)
 {
@@ -135,7 +136,14 @@ void mainImage(out vec4 c, vec2 uv)
     float crest = smoothstep(.5*CREST, .9*CREST, worldPos.y + (n - .5)*.5);
     float ring = smoothstep(${ROCK_FOAM_RADIUS.toFixed(1)}, 9., length(p) + (n - .5)*7.);
     float foam = clamp(max(crest*smoothstep(.35, .7, n), ring*smoothstep(.25, .6, n + ring*.3)), 0., 1.);
-    c = vec4(mix(vec3(1), FOAM/SEA, foam), 1);
+    // old foam drawn out into long streaks down the wind, faint, broken by the same noise
+    vec2 q = vec2(dot(p, WIND), dot(p, vec2(-WIND.y, WIND.x)));
+    float streak = seaNoise(vec2(q.x*.05 - iTime*.25, q.y*.45)) * seaNoise(vec2(q.x*.11, q.y*.9 + 3.));
+    foam = max(foam, smoothstep(.3, .55, streak)*.3*smoothstep(.2, .6, n));
+    // the troughs deep, the crests lit through with a little green as a wave's thin top is
+    float h = clamp((worldPos.y + CREST)/(2.*CREST), 0., 1.);
+    vec3 body = mix(vec3(.72,.76,.88), vec3(1.2,1.42,1.3), h*h);
+    c = vec4(mix(body, FOAM/SEA, foam), 1);
 }
 void mainNormal(inout vec3 n)
 {
@@ -288,7 +296,7 @@ function rockLayout(seed)
 }
 // ISLAND END
 
-const LANTERN_Y = SHELF_Y + 15.5, TOWER_HEIGHT = SHELF_Y + 19.3; // the middle of the lantern room, and the finial
+const LANTERN_Y = SHELF_Y + 15.5, TOWER_HEIGHT = SHELF_Y + 20.7; // the middle of the lantern room, and the rod's tip
 const ROCK_COLOR = rgb(.36,.37,.40), TOWER_WHITE = rgb(.92,.92,.95), TOWER_RED = rgb(.75,.18,.15);
 const LANTERN_COLOR = rgb(1,.82,.56), WINDOW_COLOR = rgb(1,.69,.38);
 let islandObject, towerObject, lanternObject, lanternLight, cottageLight;
@@ -306,6 +314,15 @@ function buildIsland()
         const matrix = buildMatrix(vec3(r.x, r.y, r.z), vec3(r.pitch, r.yaw, r.pitch*.5), vec3(r.sx, r.sy, r.sz));
         mesh.combine(r.kind == 'slab' ? slab : boulder, matrix, ROCK_COLOR.scale(shade, 1));
     }
+    // shaded by height: dark and wet where the swells wash, grass where the crown is level
+    const moss = rgb(.33,.40,.26);
+    for (let i = 0; i < mesh.colors.length; ++i)
+    {
+        const p = mesh.points[i], n = mesh.normals[i], c = mesh.colors[i];
+        const wet = 1 - .4*Math.max(0, Math.min(1, (1.6 - p.y)/2.2));
+        const grass = p.y > SHELF_Y - .45 && n && n.y > .75 ? .85 : 0;
+        mesh.colors[i] = rgb(c.r*wet, c.g*wet, c.b*wet, 1).lerp(moss, grass);
+    }
     islandObject = new EngineObject3D(vec3(), mesh);
     islandObject.specular = .35; // wet rock, the lightning glints on it
     islandObject.shininess = 24;
@@ -320,7 +337,14 @@ function buildLighthouse()
     const bands = [[0, 4, TOWER_WHITE], [4, 6, TOWER_RED], [6, 9, TOWER_WHITE], [9, 11, TOWER_RED], [11, 13, TOWER_WHITE]];
     for (const [y0, y1, color] of bands)
         mesh.combine(buildLathe([[radiusAt(y0), y0], [radiusAt(y1), y1]], 28, true, false), undefined, color);
-    const iron = rgb(.16,.17,.2);
+    const iron = rgb(.16,.17,.2), stone = rgb(.52,.52,.54);
+    mesh.combine(buildCylinder(6.6, .9, 28, true), vec3(0, .45, 0), stone);         // the plinth it stands on
+    mesh.combine(buildBox(vec3(1.1, 2.1, .3)), vec3(0, 1.95, radiusAt(1.95) - .05), rgb(.24,.17,.13)); // the door
+    for (let i = 0; i < 16; ++i)                                                   // brackets under the gallery
+    {
+        const a = i/16*2*PI;
+        mesh.combine(buildBox(vec3(.25, .55, .9)), buildMatrix(vec3(2.3*Math.sin(a), 12.75, 2.3*Math.cos(a)), vec3(0, a, 0)), iron);
+    }
     mesh.combine(buildCylinder(5.8, .5, 28, true), vec3(0, 13.25, 0), iron);       // gallery floor
     mesh.combine(buildTorus(5.5, .12, 28, 6, true), vec3(0, 14.4, 0), iron);       // its rail
     for (let i = 0; i < 12; ++i)                                                   // and the rail's posts
@@ -328,8 +352,21 @@ function buildLighthouse()
     mesh.combine(buildCylinder(3.4, .4, 20, true), vec3(0, 17.2, 0), TOWER_RED);   // cap rim
     mesh.combine(buildCone(3.6, 1.6, 20, true), vec3(0, 18.2, 0), TOWER_RED);      // cap
     mesh.combine(buildSphere(.4, 8, 4, true), vec3(0, 19.1, 0), iron);             // finial
+    mesh.combine(buildCylinder(.08, 1.6, 4), vec3(0, 19.9, 0), iron);              // and the rod the lightning finds
+    for (let i = 0; i < 8; ++i)                                                    // the lantern room's frame
+    {
+        const a = (i + .5)/8*2*PI;
+        mesh.combine(buildBox(vec3(.12, 3, .12)), vec3(1.55*Math.sin(a), 15.5, 1.55*Math.cos(a)), iron);
+    }
     towerObject = new EngineObject3D(vec3(0, SHELF_Y, 0), mesh);
     towerObject.specular = .25;
+
+    // the keeper's lamps behind two of the tower's windows
+    const windows = new Mesh;
+    for (const [y, a] of [[7.5, 0], [11.9, .7]])
+        windows.combine(buildBox(vec3(.55, .85, .25)), buildMatrix(vec3(radiusAt(y)*Math.sin(a), y, radiusAt(y)*Math.cos(a)), vec3(0, a, 0)));
+    const lit = new EngineObject3D(vec3(0, SHELF_Y, 0), windows, undefined, WINDOW_COLOR);
+    lit.emissive = 1.2;
 
     // the glass, lit from inside: drawn in its own warm color, bright enough to bloom
     lanternObject = new EngineObject3D(vec3(0, LANTERN_Y, 0), buildCylinder(3, 3, 16, true), undefined, LANTERN_COLOR);
@@ -343,8 +380,10 @@ function buildCottage()
     const yaw = -.5, pos = vec3(4.1, SHELF_Y, -2.4);
     const mesh = buildBox(vec3(4.6, 2.8, 3.6), .08).setColor(rgb(.72,.70,.66));
     mesh.transform(buildMatrix(vec3(0, 1.4, 0)));
-    mesh.combine(buildBox(vec3(5, 2.7, 2.7), .05), buildMatrix(vec3(0, 2.8, 0), vec3(0, 0, PI/4), vec3(1, .75, 1)), rgb(.22,.24,.3));
-    mesh.combine(buildBox(vec3(.7, 1.6, .7)), vec3(1.6, 4.2, 0), rgb(.5,.47,.44)); // chimney
+    // the roof: a long box turned on its edge, then squashed, so its gable overhangs the walls all round
+    const roof = buildBox(vec3(3.5, 3.5, 4.1), .05).transform(buildMatrix(vec3(), vec3(0, 0, PI/4)));
+    mesh.combine(roof.transform(buildMatrix(vec3(0, 2.8, 0), undefined, vec3(1, .45, 1))), undefined, rgb(.22,.24,.3));
+    mesh.combine(buildBox(vec3(.6, 1.6, .6)), vec3(1.3, 3.7, .6), rgb(.5,.47,.44)); // chimney
     const cottage = new EngineObject3D(pos, mesh);
     cottage.rotation3D = vec3(0, yaw, 0);
 
@@ -540,7 +579,7 @@ function updateLightning()
         {
             light.radius = light.inCloud ? CLOUD_LIGHT_RADIUS : STRIKE_RADIUS;
             light.intensity = f*(strike.big ? BIG_STRIKE_INTENSITY : STRIKE_INTENSITY)*(light.inCloud ? CLOUD_LIGHT_SCALE : 1);
-            light.glow = light.inCloud ? 0 : 14*f;
+            light.glow = light.inCloud ? 0 : 7*f;
         }
     }
     flash = Math.min(flash, 1.5);
@@ -589,11 +628,12 @@ function makeSplash(pos, big)
         e.emissive = .4;
         return e;
     };
-    const crown = emit(1800*k, PI/3, .5, .3, 1.5, .34*k, -.009, .99, white, blue);
-    crown.trailTime = .06;
-    const column = emit(500*k, PI/18, .8, .4, 1.6, .5*k, -.009, .99, white, blue);
-    column.trailTime = .05;
-    const mist = emit(180*k, PI/2, 5*k, 15*k, 2.8, .1, .0007, .965, rgb(1,1,1,.4), rgb(.8,.85,.95,.3), .15);
+    const crown = emit(2400*k, PI/3, 1.1, .6, 1.7, .44*k, -.009, .99, white, blue);
+    crown.trailTime = .08;
+    const column = emit(700*k, PI/16, 1.5, .8, 1.8, .6*k, -.009, .99, white, blue);
+    column.trailTime = .06;
+    const mist = emit(400*k, PI/2.5, 3*k, 10*k, 2.4, .17, .0006, .965, rgb(1,1,1,.18), rgb(.8,.85,.95,.12), .15);
+    mist.emitSize = 5*k;
     mist.roundLighting = true, mist.gravityScale = 1;
     ripples.push({x: pos.x, z: pos.z, start: time, k});
 }
@@ -659,8 +699,8 @@ function cloudPosAt(cloud, t)
 // colors for lit billboards: each is lit by the ambient, the low warm sun and any lightning near it, so the color
 // here is darker than it shows; the higher layers a little darker and bluer. The shapes carry their own light baked
 // in, bright lumpy tops and a dark flat underside, so they read as clouds before the lightning finds them
-const CLOUD_COLORS = [rgb(.50,.54,.78), rgb(.46,.50,.76), rgb(.42,.46,.72)];
-const CLOUD_EMISSIVE = .3; // the share of a puff's color it keeps unlit, so the dark side never goes muddy
+const CLOUD_COLORS = [rgb(.68,.72,1), rgb(.62,.67,.97), rgb(.56,.61,.92)];
+const CLOUD_EMISSIVE = .55; // the share of a puff's color it keeps unlit, so the dark side never goes muddy
 const CLOUD_CELL = vec2(256, 128); // each baked shape's cell in the cloud texture, side by side
 let clouds, cloudTiles = [], puffTile, glowTile;
 
@@ -732,12 +772,17 @@ function buildClouds()
             context.arc(x, y, r, 0, 2*PI);
             context.fill();
         }
-        // the shade underneath, and the base melting into the air instead of a hard line
+        // the shade underneath, a silver edge along the tops, and the base melting into the air instead of a hard line
         context.globalCompositeOperation = 'source-atop';
+        const top = context.createLinearGradient(0, 0, 0, h*.5);
+        top.addColorStop(0, 'rgba(255,255,255,.5)');
+        top.addColorStop(1, 'rgba(255,255,255,0)');
+        context.fillStyle = top;
+        context.fillRect(left, 0, w, h);
         const shade = context.createLinearGradient(0, h*.25, 0, h);
-        shade.addColorStop(0, 'rgba(40,44,74,0)');
-        shade.addColorStop(.55, 'rgba(40,44,74,.5)');
-        shade.addColorStop(1, 'rgba(28,30,54,.85)');
+        shade.addColorStop(0, 'rgba(36,40,70,0)');
+        shade.addColorStop(.5, 'rgba(36,40,70,.55)');
+        shade.addColorStop(1, 'rgba(22,24,46,.92)');
         context.fillStyle = shade;
         context.fillRect(left, 0, w, h);
         context.globalCompositeOperation = 'destination-out';
@@ -980,9 +1025,9 @@ function sprayBurst(spray, rise)
         e.emissive = .35;
         return e;
     };
-    const sheet = emit(vec3(3, .5, 3), .14, 900*k, PI/6, rgb(1,1,1,.95), rgb(.85,.92,1,.9), 1.3, .4, .22, .27*k, .99, -.008);
+    const sheet = emit(vec3(3, .5, 3), .14, 1300*k, PI/6, rgb(1,1,1,.95), rgb(.85,.92,1,.9), 1.4, .65, .35, .32*k, .99, -.008);
     sheet.trailTime = .05, sheet.gravityScale = .5;
-    const mist = emit(3, .2, 80*k, PI/3, rgb(1,1,1,.35), rgb(.85,.9,1,.3), 2.4, 2.5*k, 9*k, .09*k, .965, .0005);
+    const mist = emit(3, .2, 110*k, PI/3, rgb(1,1,1,.35), rgb(.85,.9,1,.3), 2.6, 3.5*k, 12*k, .1*k, .965, .0005);
     mist.roundLighting = true, mist.gravityScale = 1;
     const foam = emit(vec3(4, .3, 4), .15, 90*k, PI/2.2, rgb(1,1,1,.8), rgb(.9,.95,1,.7), 1.4, 1.5, 4, .05, .95, -.002);
     foam.gravityScale = .3;
