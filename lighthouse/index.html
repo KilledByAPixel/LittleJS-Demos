@@ -1194,7 +1194,7 @@ function gameUpdate()
         freeCamPos.set(camera.pos.x, camera.pos.y, camera.pos.z);
         Object.assign(freeLook, {yaw: camYaw, pitch: 0});
     }
-    if (keyWasPressed('KeyR')) { ++stormSeed; stormTime = 0; scheduleStrikes(); }
+    if (keyWasPressed('KeyR')) { ++stormSeed; stormTime = 0; strikeCount = 0; clouds = cloudLayout(stormSeed); scheduleStrikes(); }
     if (freeCam) updateFreeCam();
     else if (mouseWasPressed(0)) clickStrike();
     stormTime += slowMo ? 1/240 : 1/60;
@@ -1232,7 +1232,7 @@ function gameRenderPost()
     if (freeCam)
         drawTextScreen('free cam:  WASD move   drag to look   Q/E down/up   Shift faster   F back', vec2(size, size*1.4),
             size*.8, rgb(1,1,1,.75), 0, BLACK, 'left');
-    const text = 'click for lightning' + (recordMode ? '' : `   ${Math.round(fpsSmooth)} fps`);
+    const text = (freeCam ? '' : 'click for lightning   ') + (recordMode ? '' : `${Math.round(fpsSmooth)} fps`);
     drawTextScreen(text, vec2(size, y), size, rgb(1,1,1,.75), 0, BLACK, 'left');
     drawTextScreen('LittleJS', vec2(mainCanvasSize.x - size, y), size, rgb(1,1,1,.75), 0, BLACK, 'right');
 }
