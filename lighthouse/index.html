@@ -1421,35 +1421,29 @@ function thunderCrack(seed)
     return soundFinish(out, 4);
 }
 
-// the roll: the first long rumble, then peals, the sound coming back from further cloud and sea, each a fresh
-// swell that is bright as it arrives and darkens as it goes, at uneven times and weaker each time. It keeps to
-// the middle of the hearing range, where small speakers can still carry it, with a deep body under it for big ones
+// the roll: one long rumble after the crack, the same sound smeared out by all the sky and sea it has crossed. It
+// is not an echo, nothing comes back: it only fades, bright at first and darkening, and as it fades it grumbles,
+// its loudness shaking unevenly many times a second, the way a rumble does and a hiss does not. It keeps to the
+// middle of the hearing range, where small speakers can still carry it, with a deep body under it for big ones
 function thunderRoll(seed)
 {
-    const white = soundNoise(seed + 13), random = soundNoise(seed + 200), seconds = 9, n = SOUND_RATE*seconds | 0;
+    const white = soundNoise(seed + 13), random = soundNoise(seed + 200), seconds = 8, n = SOUND_RATE*seconds | 0;
     const out = new Float32Array(n), chance = () => (random() + 1)/2;
-    const peals = [{t: 0, gain: 1, rise: .03, fall: .55 + .4*chance()}];
-    for (let t = .6 + .5*chance(), k = 0, count = 3 + (chance()*3 | 0); k < count; ++k, t += .6 + .9*chance())
-        peals.push({t, gain: (.7 + .5*chance())*Math.exp(-t/3.5), rise: .04 + .1*chance(), fall: .5 + .6*chance()});
+    // the grumble: a new random loudness about a dozen times a second, eased between, never a steady beat
+    const rate = 9 + 6*chance(), shake = Array.from({length: seconds*16 + 2}, chance);
+    const life = 1.5 + .8*chance(), dark = .45 + .4*chance(), floor = 300 + 150*chance();
     const bottom = 1 - Math.exp(-2*Math.PI*30/SOUND_RATE), deep = 1 - Math.exp(-2*Math.PI*75/SOUND_RATE);
     let pass = 0, pass2 = 0, under = 0, low = 0, low2 = 0;
     for (let i = 0; i < n; ++i)
     {
-        const t = i/SOUND_RATE, v = white();
-        // how loud the peals leave it now, and how bright: brightness goes sooner than loudness
-        let loud = .18*Math.exp(-t/2.6), bright = 0;
-        for (const p of peals)
-            if (t >= p.t)
-            {
-                const swell = p.gain*Math.min(1, (t - p.t)/p.rise);
-                loud += swell*Math.exp(-(t - p.t)/p.fall), bright += swell*Math.exp(-(t - p.t)/.4);
-            }
-        const cut = 300 + 2300*Math.min(1, bright), a = 1 - Math.exp(-2*Math.PI*cut/SOUND_RATE);
+        const t = i/SOUND_RATE, v = white(), p = t*rate, k = p | 0, e = p - k;
+        const grumble = .3 + .7*(shake[k] + (shake[k+1] - shake[k])*e*e*(3 - 2*e));
+        const cut = floor + 2300*Math.exp(-t/dark), a = 1 - Math.exp(-2*Math.PI*cut/SOUND_RATE);
         pass += a*(v - pass), pass2 += a*(pass - pass2), under += bottom*(pass2 - under);
         low += deep*(v - low), low2 += deep*(low - low2);
         // darker noise is quieter noise, so it is lifted to keep the rumble's weight as the hiss goes
-        const fade = Math.min(1, (seconds - t)/.8);
-        out[i] = fade*((pass2 - under)*loud*(2600/cut)**.5 + low2*7*Math.exp(-t/3)*Math.min(1, t/.03));
+        const fade = Math.min(1, t/.03)*Math.min(1, (seconds - t)/.8);
+        out[i] = fade*grumble*((pass2 - under)*Math.exp(-t/life)*((floor + 2300)/cut)**.3 + low2*7*Math.exp(-t/2.5));
     }
     return soundFinish(out, 2.5);
 }
