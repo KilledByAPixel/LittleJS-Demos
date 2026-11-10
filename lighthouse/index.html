@@ -1403,23 +1403,26 @@ function buildSounds()
         for (let i = 0; i < m; ++i) data[i] = data[i]*i/m + data[n + i]*(1 - i/m);
         return data.subarray(0, n);
     };
-    const sound = (data, loudness) =>
+    // drive pushes the quiet parts up against the loud ones, as thunder close by overloads the ear
+    const sound = (data, loudness, drive=0) =>
     {
         const made = new Sound;
         made.sampleRate = SOUND_RATE;
-        made.sampleChannels = [data.map(v => v*loudness)];
+        made.sampleChannels = [data.map(v => (drive ? Math.tanh(v*drive) : v)*loudness)];
         return made;
     };
     rainSound = sound(loop(band(6.5, 1200, 9000, () => 1), .5), .5);
     // the wind, and under it the sea surging on the long swell's period, two swells a loop
     const swell = 2*PI/(WAVES[0].k*WAVES[0].speed);
     seaSound = sound(loop(band(swell*2 + .5, 40, 600, t => .45 + .55*(.5 + .5*Math.sin(2*PI*t/swell))**3), .5), .6);
-    // the crack: a sharp tearing burst in the middle of the hearing range, crackling, gone in a fifth of a second
-    crackSound = sound(echoed(band(.55, 220, 5200, t => Math.exp(-t/.1)*(1 - .75*(.5 + .5*Math.sin(2*PI*38*t)))), 1.6,
-        [[.15, .5], [.34, .36], [.64, .24], [1.1, .14]]), .6);
-    // the boom: low, rolling, seconds long, wide enough that small speakers still carry it
-    boomSound = sound(echoed(band(5, 45, 700, t => Math.min(1, t/.06)*(1 - t/5)**2*(.45 + .55*Math.sin(2*PI*5*t)**2)), 2.2,
-        [[.9, .45], [1.9, .3]]), .6);
+    // the crack: a hard snap, then the air tearing for a second, crackling unevenly, in the middle of the hearing
+    // range where it cuts through the rain
+    const tear = t => .35 + .65*Math.sin(2*PI*38*t)**2*Math.sin(2*PI*11.3*t + 1)**2;
+    crackSound = sound(echoed(band(1.2, 150, 6000, t => Math.exp(-t/.03) + .75*Math.exp(-t/.3)*tear(t)), 1.6,
+        [[.15, .5], [.34, .36], [.64, .24], [1.1, .14]]), .95, 3);
+    // the boom: rolling on for seconds after it, low but wide enough that small speakers still carry it
+    boomSound = sound(echoed(band(5.5, 50, 1100, t => Math.min(1, t/.04)*(1 - t/5.5)**1.6*(.45 + .55*Math.sin(2*PI*5*t)**2)), 2.2,
+        [[.9, .45], [1.9, .3]]), .95, 2.5);
     crashSound = sound(band(1.8, 300, 4500, t => Math.min(1, t/.07)*Math.exp(-t/.4)), .5);
 }
 
@@ -1429,7 +1432,7 @@ function queueThunder(kind, pos, big)
 {
     if (recordMode) return;
     const distance = render3D.camera.pos.distance(pos), near = 1/(1 + distance/300), size = big ? 1 : .7;
-    thunderDue.push({at: time + distance/SOUND_SPEED, crack: (kind == 'cloud' ? .3 : 1)*near*size, boom: near*size});
+    thunderDue.push({at: time + distance/SOUND_SPEED, crack: (kind == 'cloud' ? .5 : 1)*near*size*2.2, boom: near*size*2});
 }
 
 function updateSound()
