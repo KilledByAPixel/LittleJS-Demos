@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset=utf-8>
+    <title>FXHASH project</title>
+    <script id="fxhash-snippet">
+
+      //---- do not edit the following code (you can indent as you wish)
+      let alphabet = "123456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
+      var fxhash = "oo" + Array(49).fill(0).map(_=>alphabet[(Math.random()*alphabet.length)|0]).join('')
+    
+        ///////////////////////////////////////////////////////////////////////
+        const useOldHash = 0;
+        const autoReloadSeconds = 0;
+        const autoSave = 0;
+
+        const fxhashList = localStorage.fxhashList ? JSON.parse(localStorage.fxhashList) : [];
+        useOldHash ? fxhash = fxhashList[useOldHash-1] : fxhashList.unshift(fxhash);
+        fxhashList.length = 256;
+        localStorage.fxhashList = JSON.stringify(fxhashList);
+        autoReloadSeconds && setTimeout(e=>{autoSave&&saveImage();location.reload()},autoReloadSeconds*1e3);
+        ///////////////////////////////////////////////////////////////////////
+
+      let b58dec = str=>[...str].reduce((p,c)=>p*alphabet.length+alphabet.indexOf(c)|0, 0)
+      let fxhashTrunc = fxhash.slice(2)
+      let regex = new RegExp(".{" + ((fxhash.length/4)|0) + "}", 'g')
+      let hashes = fxhashTrunc.match(regex).map(h => b58dec(h))
+      let sfc32 = (a, b, c, d) => {
+        return () => {
+          a |= 0; b |= 0; c |= 0; d |= 0
+          var t = (a + b | 0) + d | 0
+          d = d + 1 | 0
+          a = b ^ b >>> 9
+          b = c + (c << 3) | 0
+          c = c << 21 | c >>> 11
+          c = c + t | 0
+          return (t >>> 0) / 4294967296
+        }
+      }
+      var fxrand = sfc32(...hashes)
+      // call this method to trigger the preview
+      function fxpreview() {
+        console.log("fxhash: TRIGGER PREVIEW")
+      }
+      //---- /do not edit the following code
+    </script>
+<style>
+html, body
+{
+    height: 100%;
+    margin: 0;
+    background:#222;
+	display: flex; 
+	justify-content: center;
+	align-items: center;
+}
+canvas
+{ 
+    box-shadow: 0px 0px 40px 10px #000;
+    max-height: 100%;
+    max-width: 100%;
+}
+</style>
+</head>
+<canvas id=mainCanvas width=2048 heigh=2048></canvas>
+<body>
+<script>
+
+'use strict';
+
+
+/*
+
+cross over belt
+differnet teeth config
+recursive gears
+gears with cut out parts
+gears on level 2 where only axel fits
+straight gears
+gears can connect to 2 other gears or 0 if there is another chain going
+if no room try to go back
+
+can connect to any gear, not just most recent
+
+*/
+mainCanvas.width = mainCanvas.height = 2048;
+
+//mainCanvas.width = innerWidth;
+//mainCanvas.height = innerHeight;
+
+///////////////////////////////////////////////////////////////////////////////
+// FX HASH ARTWORK
+
+let debug = 1;
+let hasNoise = 0;
+
+
+function init()
+{
+    canvas.width = mainCanvas.width;
+    canvas.height = mainCanvas.height;
+    noiseCanvas.width = mainCanvas.width;
+    noiseCanvas.height = mainCanvas.height;
+    hasNoise && makeNoiseLayers(noiseCanvas, 1, 4, random.float(), random.float(.5));
+
+    window.$fxhashFeatures = 
+    {
+    }
+    console.table(window.$fxhashFeatures)
+    console.log(fxhash);
+}
+
+function drawGear(pos, angle, teeth, toothWidth, toothHeight, speed)
+{
+    context.beginPath()
+    context.fillStyle = '#000';
+
+    let radius = 2*teeth*toothWidth;
+    for(let i=0; i<teeth*4; ++i)
+    {
+        let a = angle + i/teeth*PI/2;
+        a += time*speed;
+        a += PI/2;
+        a -= 1/teeth*PI/4
+        a = mod(a,2*PI);
+        context.arc(pos.x, pos.y, radius-(i&2?toothHeight:0), a, a);
+    }
+    context.fill();
+}
+
+let drawLine=(pos1, pos2, color= '#0ff')=>
+{
+    context.strokeStyle = color;
+    context.beginPath();
+    context.lineTo(pos1.x, pos1.y);
+    context.lineTo(pos2.x, pos2.y);
+    context.stroke();
+
+}
+
+let strokeArc=(pos, r, a1=0, a2=9, counterclockwise, color= '#00f')=>
+{
+    context.strokeStyle = color;
+    context.beginPath();
+    context.arc(pos.x, pos.y, r, a1, a2, counterclockwise);
+    context.stroke();
+}
+
+let fillArc=(pos, r, a1=0, a2=9, counterclockwise, color= '#f00')=>
+{
+    context.fillStyle = color;
+    context.beginPath();
+    context.arc(pos.x, pos.y, r, a1, a2, counterclockwise);
+    context.fill();
+}
+
+
+function update(t)
+{
+    //   for(j=X=Y=27;j--;x.fill(),t*=n/(n=(j**5%7)*2+3),X-=j-18?j-9?-r*2:(Y=1e3,1754):(Y=492,3064))
+
+    random.resetSeed();
+    
+    canvas.width|=0
+    let pos = vec2(1e3,500);
+    let angle = 0;
+    let teeth = random.int(10,50);
+    let scale = .2;
+    let toothWidth = 20*scale;
+    let toothHeight = 3*toothWidth;
+    let speed = random.float(.5,1);
+
+    let circleList = [];
+
+    function checkCircles(newPos, newRadius)
+    {
+        let margin = 50 + newRadius;
+        if (newPos.x < margin || newPos.x > canvas.width - margin)
+            return;
+        if (newPos.y < margin || newPos.y > canvas.height - margin)
+            return;
+
+        for(let c of circleList)
+        {
+            let d = c.pos.distance(newPos);
+            if (d < c.radius + newRadius)
+                return false;
+        }
+        return true;
+    }
+
+    let lastBelt;
+
+    for(let i = 395; i--;)
+    {
+        drawGear(pos, angle, teeth, toothWidth, toothHeight, speed);
+
+        if (lastBelt)
+        {
+            let newPos = lastBelt.newPos;
+            let pos = lastBelt.pos;
+            let r1 = lastBelt.r1;
+            let r2 = lastBelt.r2;
+
+            // belt maths
+            let P = Math.hypot(newPos.y-pos.y,newPos.x-pos.x);
+            let a = Math.atan2(newPos.y-pos.y,newPos.x-pos.x);
+            let a2 =  Math.acos((r1-r2)/P);
+
+            let l = 2*P*Math.sin(a2) + r1*(2*PI-a2*2) + r2*(a2*2);
+
+            let cross = 1;
+            let posA = pos.add(vec2(Math.cos(a+a2)*r1, Math.sin(a+a2)*r1));
+            let newPosA = newPos.add(vec2(Math.cos(a+a2*cross)*r2, Math.sin(a+a2*cross)*r2));
+            let posB = pos.add(vec2(Math.cos(a-a2)*r1, Math.sin(a-a2)*r1));
+            let newPosB = newPos.add(vec2(Math.cos(a-a2*cross)*r2, Math.sin(a-a2*cross)*r2));
+
+            let beltWidth = 29*scale;
+            context.lineWidth = beltWidth;
+            fillArc(pos, r1-beltWidth, 0, 9, 0, 'red');
+            fillArc(newPos, r2-beltWidth, 0, 9, 0, 'red');
+            strokeArc(pos, r1-beltWidth, 0, 9, 0, 'white');
+            strokeArc(newPos, r2-beltWidth, 0, 9, 0, 'white');
+
+            context.beginPath()
+            context.arc(pos.x, pos.y, r1, a-a2, a+a2, 1);
+            context.arc(newPos.x, newPos.y, r2, a+a2, a-a2,1);
+            context.arc(pos.x, pos.y, r1, a-a2, a-a2, 1);
+            context.lineDashOffset = t*lastBelt.speed;
+            
+            context.setLineDash([])
+            context.strokeStyle='#444';
+            context.stroke()
+            let chainLinks = random.int(40,90)
+            context.setLineDash([l/chainLinks])
+            context.strokeStyle='#0ff';
+            context.stroke()
+            context.setLineDash([])
+
+            lastBelt = 0;
+        }
+
+        let radius = 2*teeth*toothWidth;
+        fillArc(pos, radius*.1, 0, 9, 0, '#00f');
+
+        let newTeeth, offsetAngle, newPos, isSafe;
+
+        let isBand = 0;random.bool();
+        if (!isBand)
+        for(let tries = 99; tries--;)
+        {
+            newTeeth = random.int(3,49);
+            let newRadius = 2*newTeeth*toothWidth;
+            offsetAngle = random.angle();
+            let offset = vec2angle(offsetAngle,radius+newRadius-toothHeight);
+            newPos = pos.add(offset);
+
+            isSafe = checkCircles(newPos, newRadius);
+            if (isSafe)
+                break;
+        }
+
+        if (!isSafe)
+        {
+            isSafe = 1;
+            isBand = 1;
+        }
+
+        if (!isBand)
+        {
+            angle = -angle*(teeth/newTeeth);
+            if (newTeeth%2==0)// even teeth
+                angle -= 1/newTeeth*PI/1;
+            angle -= offsetAngle + offsetAngle*(teeth/newTeeth);
+            speed *= -teeth/newTeeth;
+        }
+
+        circleList.push({pos, radius});
+
+        let newRadius;
+        if (isBand)
+        {
+            // find an open spot
+            for(let tries = 0; tries<1e3; ++tries)
+            {
+                toothWidth = random.float(20,40)*scale;
+                toothHeight = 3*toothWidth;
+
+                let distance = random.float(2*tries,2*tries+2);
+                newPos = pos.add(vec2angle(random.angle(),distance));
+
+                newTeeth = random.int(3,29);
+                newRadius = 2*newTeeth*toothWidth;
+                isSafe = checkCircles(newPos, newRadius);
+                if (isSafe)
+                    break;
+            }
+
+            let r1 = radius * random.float(.3,.6);
+            let r2 = newRadius * random.float(.3,.6);
+            
+            let beltSpeed = r1*speed;r1*speed/(2*PI);
+            lastBelt = {pos, newPos, r1, r2, speed:beltSpeed};
+            speed *= r1/r2;
+        }
+
+        if (!isSafe)
+        {
+            //console.log('unsafe');
+            break;
+        }
+
+        teeth = newTeeth;
+        pos = newPos;
+    }
+
+    /*
+        for(let c of circleList)
+        {
+            context.beginPath();
+            context.arc(c.pos.x, c.pos.y, c.radius, 0, 9);
+            context.stroke();
+        }*/
+    
+    compositeImage();
+}
+
+function compositeImage()
+{
+    mainCanvas.width |= 0;
+    mainContext.fillStyle='#fff';
+    mainContext.fillRect(0,0,mainCanvas.width,mainCanvas.height);
+    mainContext.drawImage(canvas,0,0,mainCanvas.width,mainCanvas.height);
+
+    if (hasNoise)
+    {
+        mainContext.save();
+        mainContext.globalAlpha = .1;
+        mainContext.drawImage(noiseCanvas, 0, 0);
+        mainContext.restore();
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// MINI GENERATIVE LIBRARY
+
+const PI      = Math.PI;
+const abs     = (a)=> a < 0 ? -a : a;
+const min     = (a, b)=> a < b ?  a : b;
+const max     = (a, b)=> a > b ?  a : b;
+const sign    = (a)=> a < 0 ? -1 : 1;
+const mod     = (a, b=1)=> ((a % b) + b) % b;
+const clamp   = (v, min=0, max=1)=> v < min ? min : v > max ? max : v;
+const percent = (v, min=0, max=1)=> max-min ? clamp((v-min) / (max-min)) : 0;
+const lerp    = (p, min=0, max=1)=> min + clamp(p) * (max-min);
+const smoothStep = (p)=> p * p * (3 - 2 * p);
+const hsl = (h=0,s=0,l=0,a=1) => `hsla(${mod(h)*360},${clamp(s)*100}%,${clamp(l)*100}%,${clamp(a)})`;
+const lerpWrap = (p, min, max, wrap=1)=> 
+{
+    min = mod(min/wrap);
+    max = mod(max/wrap); 
+    max += min - max > .5 ? 1 : max - min > .5 ? -1 : 0;
+    return mod(lerp(p, min, max))*wrap;
+}
+const shuffle=(array)=>
+{
+    for(let currentIndex = array.length; currentIndex;)
+    {
+        const randomIndex = random.int(currentIndex--);
+        [array[currentIndex], array[randomIndex]] = [array[randomIndex], array[currentIndex]];
+    }
+    return array;
+}
+
+function logColors(colors, title = "")
+{
+    let colorCssList = [];
+    let colorString = "";
+    for (const color of colors)
+    {
+        colorString += "%c      ";
+        colorCssList.push("border:1px solid #000; background:" + color);
+    }
+    console.log(title + colorString, ...colorCssList);
+}
+
+const noise = (X, Y) =>
+{
+    const XP = smoothStep(mod(X));
+    const YP = smoothStep(mod(Y));
+    const hash = (X,Y)=> (Math.sin(Math.floor(X)**2^Math.floor(Y)**3)*1e5+1e5)%1;
+    const noise1 = (X,Y)=> (1-XP)*hash(X,Y) + XP*hash(X+1,Y);
+    return (1-YP)*noise1(X,Y) + YP*noise1(X,Y+1);
+}
+
+const fractalNoise = (X, Y, octaves=4) =>
+{
+    const H = 1, G = 2**-H;
+    let f = 1, a = 1, ta = a, t = 0;
+    for (let i = octaves; --i >= 0;)
+    {
+    	t += a * noise(X*f, Y*f);
+    	ta += a *= G;
+        f *= 2;
+    }
+    return t/ta;
+}
+
+const curlNoise = (X, Y, octaves=4) =>
+{
+    const e = 1;
+    const dx = (fractalNoise(X+e, Y, octaves) - fractalNoise(X-e, Y, octaves)) / (2*e);
+    const dy = (fractalNoise(X, Y+e, octaves) - fractalNoise(X, Y-e, octaves)) / (2*e);
+    return vec2(dx, -dy);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// SEEDED RANDOM GENERATOR
+
+class Random
+{
+    constructor(seed) { this.setSeed(seed); }
+    setSeed(seed) { this.startSeed = this.seed = seed|0; }
+    resetSeed() { this.seed = this.startSeed; }
+    saveSeed() { this.startSeed = this.seed; }
+    float(a=1, b=0)
+    {   // xorshift
+        this.seed ^= this.seed <<  13;
+        this.seed ^= this.seed >>> 17;
+        this.seed ^= this.seed <<  5;
+        return b + (a-b) * Math.abs(this.seed % 1e7) / 1e7;
+    }
+    floatSign(a, b)   { return this.float(a,b) * this.sign(); }
+    int(a=1, b=0)     { return this.float(a, b)|0; }
+    bool(chance = .5) { return this.float() < chance; }
+    sign()            { return this.bool() ? -1 : 1; }
+    angle(p=1)        { return this.float(PI*2*p); }
+    circle(radius, bias = .5)
+    {
+        const r = this.float()**bias*radius;
+        const a = this.float(PI*2);
+        return vec2(r*Math.cos(a), r*Math.sin(a));
+    }
+    color() { return new Color(this.float(), this.float(), this.float()); }
+}
+const random = new Random(fxrand()*1e9);
+
+///////////////////////////////////////////////////////////////////////////////
+// HSL COLOR OBJECT
+
+class Color
+{
+    constructor(h=0, s=0, l=0, a=1)
+    { this.h = h; this.s = s; this.l = l; this.a = a; }
+
+    copy() { return new Color(this.h, this.s, this.l, this.a ); }
+    add(c)  { return new Color(this.h+c.h, this.s+c.s, this.l+c.l, this.a+c.a); }
+    setH(h) { return new Color(h, this.s, this.l, this.a ); }
+    setS(s) { return new Color(this.h, s, this.l, this.a ); }
+    setL(l) { return new Color(this.h, this.s, l, this.a ); }
+    setA(a) { return new Color(this.h, this.s, this.l, a ); }
+
+    lerp(color, percent) 
+    {
+        return new Color(
+            lerpWrap(percent, this.h, color.h),
+            lerp(percent, this.s, color.s),
+            lerp(percent, this.l, color.l),
+            lerp(percent, this.a, color.a)
+        );
+    }
+
+    mutate(max=.1, min=0, r=random) 
+    {
+        return new Color(
+            mod(  this.h + r.float(min,max)*r.sign()),
+            clamp(clamp(this.s,max,1-max) + r.float(min,max)*r.sign()),
+            clamp(clamp(this.l,max,1-max) + r.float(min,max)*r.sign()),
+            this.a
+        );
+    }
+
+    toString()      
+    { return `hsla(${mod(this.h)*360|0},${clamp(this.s)*100|0}%,${clamp(this.l)*100|0}%,${clamp(this.a)})`; }
+
+    setRGB(r, g, b)
+    {
+        r /= 255;
+        g /= 255;
+        b /= 255;
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const l = (max + min) / 2;
+        let h = 0, s = 0;
+
+        if (max != min)
+        {
+            let d = max - min;
+            s = l > .5 ? d / (2 - max - min) : d / (max + min);
+            if (r == max)
+                h = (g - b) / d + (g < b ? 6 : 0);
+            else if (g == max)
+                h = (b - r) / d + 2;
+            else if (b == max)
+                h =  (r - g) / d + 4;
+        }
+
+        this.h = h / 6;
+        this.s = s;
+        this.l = l;
+        return this;
+    }
+}
+
+function logColors(colors, title = '')
+{
+    let colorCssList = [], colorString = '';
+    for (const color of colors) 
+    {
+        colorString += '%c      ';
+        colorCssList.push('border:1px solid #000; background:' + color);
+    }
+    console.log(title + colorString, ...colorCssList);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// 2D VECTOR CLASS
+
+const vec2 = (x, y)=> new Vector2(x, y);
+const vec2angle = (angle=0, length=1) => vec2().setAngle(angle, length);
+
+class Vector2
+{
+    constructor(x=0, y=0) { this.x = x; this.y = y; }
+    copy() { return vec2(this.x, this.y); }
+    add(v) { return vec2(this.x + v.x, this.y + v.y); }
+    subtract(v) { return vec2(this.x - v.x, this.y - v.y); }
+    multiply(v) { return vec2(this.x * v.x, this.y * v.y); }
+    divide(v) { return vec2(this.x / v.x, this.y / v.y); }
+    scale(s) { return vec2(this.x * s, this.y * s); }
+    length() { return this.lengthSquared()**.5; }
+    lengthSquared() { return this.x**2 + this.y**2; }
+    distance(v) { return this.distanceSquared(v)**.5; }
+    distanceSquared(v) { return (this.x - v.x)**2 + (this.y - v.y)**2; }
+    normalize(length=1) { const l = this.length(); return l ? this.scale(length/l) : vec2(length); }
+    clampLength(length=1) { const l = this.length(); return l > length ? this.scale(length/l) : this; }
+    dot(v) { return this.x*v.x + this.y*v.y; }
+    cross(v) { return this.x*v.y - this.y*v.x; }
+    angle() { return Math.atan2(this.x, this.y); }
+    setAngle(a=0, length=1) { this.x = length*Math.sin(a); this.y = length*Math.cos(a); return this; }
+    rotate(a) { const c = Math.cos(a), s = Math.sin(a); return vec2(this.x*c-this.y*s, this.x*s+this.y*c); }
+    direction() { return abs(this.x) > abs(this.y) ? this.x < 0 ? 3 : 1 : this.y < 0 ? 2 : 0; }
+    invert() { return vec2(this.y, -this.x); }
+    floor() { return vec2(Math.floor(this.x), Math.floor(this.y)); }
+    area() { return this.x * this.y; }
+    lerp(p,v) { return this.add(v.subtract(this).scale(clamp(p))); }
+
+    linePercent(start,end)
+    {
+        const deltaPos = end.subtract(start);
+        const deltaPosMagSquared = deltaPos.lengthSquared();
+        const deltaStart = this.subtract(start);
+        const dp = deltaStart.dot(deltaPos);
+
+        if (dp >= deltaPosMagSquared)
+            return 1;
+        else if (dp <= 0)
+            return 0;
+        else
+            return dp / deltaPosMagSquared;
+    }
+
+    lineNearestPoint(start,end)
+    {
+        return start.lerp(this.linePercent(start,end), end);
+    }
+
+    lineDistanceSquared(start,end)
+    {
+        const nearest = this.lineNearestPoint(start, end);
+        return this.subtract(nearest).lengthSquared();
+    }
+
+    isInRectangle(min, max)
+    {
+        return this.x >= min.x && this.x <= max.x &&
+               this.y >= min.y && this.y <= max.y;
+    }
+
+    toString()      
+    { return `Vector2(${this.x},${this.y},${this.z})`; }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// 2D VECTOR MATH
+
+// 2d finite line segment intersection test
+function lineSegmentIntersection( segment1a, segment1b, segment2a, segment2b )
+{
+	const delta1 = segment1b.subtract(segment1a);
+	const delta2 = segment2b.subtract(segment2a);
+	const delta3 = segment1a.subtract(segment2a);
+	const d = delta1.cross(delta2);
+	const ud1 = delta2.cross(delta3);
+
+	if (d > 0)
+	{
+		if (ud1 < 0 || ud1 > d)
+			return; // outside bounds of segment 1
+
+		const ud2 = delta1.cross(delta3);
+		if (ud2 < 0 || ud2 > d)
+			return; // outside bounds of segment 2
+	}
+	else if (d < 0)
+	{
+		if (ud1 > 0 || ud1 < d)
+			return; // outside bounds of segment 1
+
+		const ud2 = delta1.cross(delta3);
+		if (ud2 > 0 || ud2 < d)
+			return; // outside bounds of segment 2
+	}
+	else // d == 0
+		return; // segments are parallel
+
+	// compute intersection point
+	return segment1a.add(delta1.scale(ud1/d));
+}
+
+// return true if point is inside polygon
+function polygonContainsPoint(pointList, point)
+{
+    for (let i = pointList.length; i--;)
+    {
+        const segment1a = pointList[i];
+        const segment1b = pointList[(i+1)%pointList.length];
+        const d1 = segment1a.subtract(segment1b);
+        const d2 = segment1b.subtract(point);
+		if (d1.cross(d2) > 0)
+			return;
+    }
+    return 1;
+}
+
+// return bounding box from list of points
+function getAABB(pointList)
+{
+    const min = pointList[0].copy(), max = pointList[0].copy();
+    for (const p of pointList)
+    {
+        min.x = Math.min(min.x, p.x);
+        min.y = Math.min(min.y, p.y);
+        max.x = Math.max(max.x, p.x);
+        max.y = Math.max(max.y, p.y);
+    }
+
+    return {min, max}
+}
+
+// bounding box overlap test
+function overlapTestAABB(aabb1, aabb2)
+{
+    return aabb2.max.x >= aabb1.min.x &&
+        aabb2.min.x <= aabb1.max.x &&
+        aabb2.max.y >= aabb1.min.y &&
+        aabb2.min.y <= aabb1.max.y;
+}
+
+// polygon overlap test
+function overlapTestPolygons(pointList1, pointList2)
+{
+    // broad phase
+    const aabb1 = getAABB(pointList1);
+    const aabb2 = getAABB(pointList2);
+    if (!overlapTestAABB(aabb1, aabb2))
+        return 0;
+
+    // check if any of the lines overlap
+    for (let i = pointList1.length; i--;)
+    {
+        const segment1a = pointList1[i];
+        const segment1b = pointList1[(i+1)%pointList1.length];
+        for (let j = pointList2.length; j--;)
+        {
+            const segment2a = pointList2[j];
+            const segment2b = pointList2[(j+1)%pointList2.length];
+            if (lineSegmentIntersection(segment1a, segment1b, segment2a, segment2b))
+                return 1;
+        }
+    }
+
+    // check if one inside the other
+    if (polygonContainsPoint(pointList1, pointList2[0]))
+        return 1;
+    if (polygonContainsPoint(pointList2, pointList1[0]))
+        return 1;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// NOISE GENERATOR
+
+const noiseCanvas = document.createElement('canvas');
+
+function makeNoiseLayers(
+    canvas, minPower=1, maxPower=3,
+    hue=.5, hueRandomness=.5,
+    saturation=.5, saturationRandomness=.5,
+    lightness=.5, lightnessRandomness=.5,
+    alpha=.5, alphaRandomness=.5
+)
+{
+    for(let power = maxPower; power >= minPower; --power)
+        makeNoise(canvas, power, 
+            hue, hueRandomness,
+            saturation, saturationRandomness,
+            lightness, lightnessRandomness,
+            alpha, alphaRandomness);
+}
+
+function makeNoise(
+    canvas, power=1, 
+    hue=.5, hueRandomness=.5,
+    saturation=.5, saturationRandomness=.5,
+    lightness=.5, lightnessRandomness=.5,
+    alpha=.5, alphaRandomness=.5
+)
+{
+    // generate noise overlay
+    const size = 2**power;
+    const noiseImageData = new ImageData(
+        workCanvas.width = canvas.width/size, 
+        workCanvas.height = canvas.height/size);
+
+    for(let i = 0; i < noiseImageData.data.length; i += 4)
+    {
+        const h = mod(hue + random.floatSign(hueRandomness));
+        const s = clamp(saturation + random.floatSign(saturationRandomness));
+        const l = clamp(lightness + random.floatSign(lightnessRandomness));
+        const a = clamp(alpha + random.floatSign(alphaRandomness));
+        const q = l < .5 ? l*(1+s) : l+s-l*s, p = 2*l-q,
+            f = (p, q, t)=>
+                (t = ((t%1)+1)%1) < 1/6 ? p+(q-p)*6*t :
+                t < 1/2 ? q :
+                t < 2/3 ? p+(q-p)*(2/3-t)*6 : p;
+
+        const rgba = [255*f(p, q, h + 1/3), 255*f(p, q, h), 255*f(p, q, h - 1/3), 255*a];
+        noiseImageData.data.set(rgba, i);
+    }
+    workContext.putImageData(noiseImageData, 0, 0);
+    canvas.getContext('2d').drawImage(workCanvas, 0, 0, canvas.width, canvas.height);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// STARTUP CODE
+
+let frame = 0, time = 0;
+const mainContext = mainCanvas.getContext('2d');
+const canvas = document.createElement('canvas');
+const context = canvas.getContext('2d');
+const workCanvas = document.createElement('canvas');
+const workContext = workCanvas.getContext('2d');
+
+function loop(timeReal)
+{
+    // update
+    const FPS = 60;
+    time = frame++ / FPS;
+    update(time);
+    requestAnimationFrame(loop);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// STARTUP
+
+init();
+requestAnimationFrame(loop);
+
+function saveImage()
+{
+    const saveType = debug ? 'jpg' : 'png';
+    downloadLink.download = fxhash + '.' + saveType;
+    downloadLink.href = mainCanvas.toDataURL('image/'+saveType)
+        .replace('image/' + saveType, 'image/octet-stream');
+    downloadLink.click();
+}
+
+// download link
+const downloadLink = document.createElement('a');
+if (debug)
+    oncontextmenu = e=> false;
+onmousedown = e=>
+{
+    if (e.button == 0)
+        return;
+
+    // save when right clicked
+    saveImage();
+}
+
+</script>
+</body>
+</html>
