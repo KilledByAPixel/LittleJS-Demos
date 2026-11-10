@@ -193,7 +193,7 @@ function seaHeightAt(x, z, t)
 // SEA END
 
 const SEA_SIZE = 1000, SEA_SEGMENTS = 320;  // meters across and cells a side, about 3m a cell
-const SEA_COLOR = rgb(.06,.19,.28), FOAM_COLOR = rgb(.78,.83,.85);
+const SEA_COLOR = rgb(.06,.19,.28), FOAM_COLOR = rgb(.88,.92,.95);
 const FOG_START = 90, FOG_END = 380, FOG_COLOR = rgb(.17,.18,.36);
 const SUN_AZIMUTH = -.6;                    // where the last of the light is, left of the first shot's view
 const AMBIENT_COLOR = rgb(.30,.34,.55), AMBIENT_FLASH = rgb(.22,.25,.42);
@@ -202,10 +202,19 @@ let sea;
 // the waves as GLSL constants, written from WAVES so the shader and seaHeightAt can never drift apart
 const glslWaves = WAVES.map(w => `vec4(${w.dir[0].toFixed(4)},${w.dir[1].toFixed(4)},${w.k.toFixed(4)},${(w.k*w.speed).toFixed(4)})`).join(',');
 const glslWaveShape = WAVES.map(w => `vec3(${w.amp.toFixed(4)},${(w.steep/(w.k*w.amp*WAVES.length)).toFixed(4)},${w.phase.toFixed(4)})`).join(',');
+// the chop: short waves fanned round the wind, too small for the grid, that only tilt the light. Direction, wavenumber
+// and angular speed for each, as the swells have
+const CHOP = [[5.5, -.9], [3.6, .7], [2.4, -.3], [1.6, 1.2], [1.1, -1.4], [.75, .3], [.5, -.6]].map(([length, angle]) =>
+{
+    const c = Math.cos(angle), s = Math.sin(angle), k = 2*Math.PI/length;
+    return [WIND_DIR[0]*c - WIND_DIR[1]*s, WIND_DIR[0]*s + WIND_DIR[1]*c, k, Math.sqrt(9.8*k)];
+});
+const glslChop = CHOP.map(w => `vec4(${w.map(v => v.toFixed(4)).join(',')})`).join(',');
 const glslVec3 = c => `vec3(${c.r.toFixed(4)},${c.g.toFixed(4)},${c.b.toFixed(4)})`;
 const SEA_GLSL_COMMON = `
 const vec4 WAVE[${WAVES.length}] = vec4[](${glslWaves});   // direction, wavenumber, angular speed
 const vec3 SHAPE[${WAVES.length}] = vec3[](${glslWaveShape}); // amplitude, Gerstner pull, phase
+const vec4 CHOP[${CHOP.length}] = vec4[](${glslChop});
 float seaHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
 float seaNoise(vec2 p)
 {
@@ -234,26 +243,41 @@ void mainImage(out vec4 c, vec2 uv)
     // foam: streaks along the highest crests, and a churned ring round the rocks, both broken up by noise
     vec2 p = worldPos.xz;
     float n = seaNoise(p*.35 + vec2(iTime*.3, 0.))*.6 + seaNoise(p*1.3 - vec2(0., iTime*.5))*.4;
-    float crest = smoothstep(.5*CREST, .9*CREST, worldPos.y + (n - .5)*.5);
+    float crest = smoothstep(.42*CREST, .85*CREST, worldPos.y + (n - .5)*.5);
     float shore = ${SHORE_BASE.toFixed(2)}${SHORE_WAVES.map(([amp, turns, phase]) => ` + ${amp.toFixed(2)}*sin(${turns.toFixed(1)}*atan(p.x, p.y) + ${phase.toFixed(2)})`).join('')};
-    float ring = smoothstep(1.7, 1.05, length(p)/shore + (n - .5)*.5);
+    // round the rocks the water is churned white, further out when a swell is in and drawn back when it is out
+    float surge = .25*worldPos.y/CREST, land = length(p)/shore;
+    float ring = smoothstep(1.75 + surge, 1.05, land + (n - .5)*.5);
+    float shallow = smoothstep(2.1, 1., land);
 ${SKERRIES.map(k => `    ring = max(ring, smoothstep(2.3, 1.2, length(p - vec2(${k.x.toFixed(1)}, ${k.z.toFixed(1)}))/${k.r.toFixed(1)} + (n - .5)*.7));`).join('\n')}
-    float foam = clamp(max(crest*smoothstep(.35, .7, n), ring*smoothstep(.25, .6, n + ring*.3)), 0., 1.);
+    float foam = clamp(max(crest*smoothstep(.35, .7, n), ring*smoothstep(.2, .55, n + ring*.4)), 0., 1.);
+    // foam is lace, not paint: holes open in it along the lines of a finer noise
+    float lace = abs(seaNoise(p*1.7 + vec2(iTime*.2, iTime*.1)) - .5)*2.;
+    foam *= mix(.35, 1., smoothstep(.05, .3, lace + foam*.25));
     // old foam drawn out into long streaks down the wind, faint, broken by the same noise
     vec2 q = vec2(dot(p, WIND), dot(p, vec2(-WIND.y, WIND.x)));
     float streak = seaNoise(vec2(q.x*.05 - iTime*.25, q.y*.45)) * seaNoise(vec2(q.x*.11, q.y*.9 + 3.));
     foam = max(foam, smoothstep(.3, .55, streak)*.3*smoothstep(.2, .6, n));
     // the troughs deep, the crests lit through with a little green as a wave's thin top is
     float h = clamp((worldPos.y + CREST)/(2.*CREST), 0., 1.);
-    vec3 body = mix(vec3(.72,.76,.88), vec3(1.2,1.42,1.3), h*h);
+    vec3 body = mix(vec3(.7,.74,.88), vec3(1.2,1.45,1.3), h*h);
+    body = mix(body, vec3(1.15,1.75,1.5), shallow*.45); // paler and greener over the rock shelf
     c = vec4(mix(body, FOAM/SEA, foam), 1);
 }
 void mainNormal(inout vec3 n)
 {
-    // the short wave and the chop the grid can't carry, added in here
+    // the short swell the grid can't carry, then the chop: each small wave fades out where it would be finer than
+    // the picture can show, and a slow noise slides their phases about so they never line up into a pattern
     vec2 p = worldPos.xz, s = seaSlope(p, ${SEA_DISPLACED}, ${WAVES.length});
-    vec2 q = p*.6 + vec2(iTime*.4, iTime*.15);
-    s += .12*vec2(seaNoise(q) - seaNoise(q + vec2(.5, 0)), seaNoise(q) - seaNoise(q + vec2(0, .5)))*4.;
+    float d = distance(cameraPos, worldPos), warp = seaNoise(p*.06 + iTime*.02)*6.283;
+    for (int i = 0; i < ${CHOP.length}; ++i)
+    {
+        float a = CHOP[i].z*dot(CHOP[i].xy, p) - CHOP[i].w*iTime + warp*(1. + float(i)*.6);
+        s += CHOP[i].xy*(.085*cos(a)*clamp(150./(CHOP[i].z*d) - .3, 0., 1.));
+    }
+    // the rain: the water near the lens stippled with drops, new ones every few frames
+    float t = floor(iTime*15.);
+    s += clamp(1. - d/40., 0., 1.)*.4*(vec2(seaNoise(p*8. + t*13.7), seaNoise(p.yx*8. + t*5.3 + 40.)) - .5);
     n = normalize(n + vec3(-s.x, 0., -s.y));
 }`, `${SEA_GLSL_COMMON}
 void mainVertex(inout vec3 pos, inout vec3 normal)
@@ -354,14 +378,16 @@ function buildSea()
     const mesh = buildGrid(vec2(SEA_SIZE), SEA_SEGMENTS, SEA_COLOR);
     sea = new EngineObject3D(vec3(), mesh);
     sea.shader = SEA_SHADER;
-    sea.specular = 1.2;
-    sea.shininess = 60;
+    sea.specular = 1.4;
+    sea.shininess = 80;
     sea.reflectivity = .35;
 }
 
 const LANTERN_Y = SHELF_Y + 15.5, TOWER_HEIGHT = SHELF_Y + 20.7; // the middle of the lantern room, and the rod's tip
 const ROCK_COLOR = rgb(.36,.37,.40), TOWER_WHITE = rgb(.92,.92,.95), TOWER_RED = rgb(.75,.18,.15);
 const LANTERN_COLOR = rgb(1,.82,.56), WINDOW_COLOR = rgb(1,.69,.38);
+// the tower's windows: height up the tower, angle round it (0 faces +z, the first shot's camera), and if a lamp is lit
+const TOWER_WINDOWS = [[7.5, 0, true], [11.9, .7, true], [3.1, -1.2, false], [7.5, 2.3, false], [11.9, -1.7, true], [3.1, 1.6, true]];
 let islandObject, towerObject, lanternObject, lanternLight, cottageLight;
 
 // the island's mesh: the height above cut into small flat facets, for the clean stylized look, each colored by
@@ -396,7 +422,20 @@ function buildLighthouse()
     const bands = [[0, 4, TOWER_WHITE], [4, 6, TOWER_RED], [6, 9, TOWER_WHITE], [9, 11, TOWER_RED], [11, 13, TOWER_WHITE]];
     for (const [y0, y1, color] of bands)
         mesh.combine(buildLathe([[radiusAt(y0), y0], [radiusAt(y1), y1]], 28, true, false), undefined, color);
-    const iron = rgb(.16,.17,.2), stone = rgb(.52,.52,.54);
+    // weathered: the paint a little darker and dirtier toward the foot
+    for (let i = 0; i < mesh.colors.length; ++i)
+        mesh.colors[i] = mesh.colors[i].scale(.82 + .18*clamp(mesh.points[i].y/13), 1);
+    const iron = rgb(.16,.17,.2), stone = rgb(.52,.52,.54), glass = rgb(.09,.11,.17);
+    mesh.combine(buildBox(vec3(1.7, .6, .8)), vec3(0, .3, 3.6), stone);             // two steps up to the door
+    mesh.combine(buildBox(vec3(1.7, .3, .7)), vec3(0, .15, 4.2), stone);
+    mesh.combine(buildBox(vec3(1.45, 2.4, .3)), vec3(0, 2.1, radiusAt(2.1) - .12), stone); // the door's frame
+    // window frames all the way up, the dark ones glazed here, the lit ones' panes drawn with the lamps below
+    for (const [y, a, lit] of TOWER_WINDOWS)
+    {
+        const r = radiusAt(y), at = (out) => vec3((r + out)*Math.sin(a), y, (r + out)*Math.cos(a));
+        mesh.combine(buildBox(vec3(.85, 1.15, .3)), buildMatrix(at(-.1), vec3(0, a, 0)), iron);
+        lit || mesh.combine(buildBox(vec3(.55, .85, .3)), buildMatrix(at(-.05), vec3(0, a, 0)), glass);
+    }
     mesh.combine(buildCylinder(6.6, .9, 28, true), vec3(0, .45, 0), stone);         // the plinth it stands on
     mesh.combine(buildBox(vec3(1.1, 2.1, .3)), vec3(0, 1.95, radiusAt(1.95) - .05), rgb(.24,.17,.13)); // the door
     for (let i = 0; i < 16; ++i)                                                   // brackets under the gallery
@@ -405,9 +444,15 @@ function buildLighthouse()
         mesh.combine(buildBox(vec3(.25, .55, .9)), buildMatrix(vec3(2.3*Math.sin(a), 12.75, 2.3*Math.cos(a)), vec3(0, a, 0)), iron);
     }
     mesh.combine(buildCylinder(5.8, .5, 28, true), vec3(0, 13.25, 0), iron);       // gallery floor
-    mesh.combine(buildTorus(5.5, .12, 28, 6, true), vec3(0, 14.4, 0), iron);       // its rail
-    for (let i = 0; i < 12; ++i)                                                   // and the rail's posts
-        mesh.combine(buildCylinder(.1, .9, 4), vec3(2.75*Math.sin(i/12*2*PI), 13.95, 2.75*Math.cos(i/12*2*PI)), iron);
+    mesh.combine(buildTorus(5.9, .14, 28, 6, true), vec3(0, 13.5, 0), iron);       // its lip
+    mesh.combine(buildTorus(5.5, .12, 28, 6, true), vec3(0, 14.4, 0), iron);       // its rail, and a lower one
+    mesh.combine(buildTorus(5.5, .07, 28, 4, true), vec3(0, 13.95, 0), iron);
+    for (let i = 0; i < 24; ++i)                                                   // and the rail's posts
+        mesh.combine(buildCylinder(.08, .9, 4), vec3(2.75*Math.sin(i/24*2*PI), 13.95, 2.75*Math.cos(i/24*2*PI)), iron);
+    for (const y of [14.06, 15.5, 16.94])                                          // rings round the lantern's glass
+        mesh.combine(buildTorus(3.12, y == 15.5 ? .06 : .11, 20, 4, true), vec3(0, y, 0), iron);
+    mesh.combine(buildBox(vec3(1.3, .06, .06)), vec3(0, 20.2, 0), iron);            // the weather vane
+    mesh.combine(buildBox(vec3(.35, .3, .04)), vec3(-.55, 20.2, 0), iron);
     mesh.combine(buildCylinder(3.4, .4, 20, true), vec3(0, 17.2, 0), TOWER_RED);   // cap rim
     mesh.combine(buildCone(3.6, 1.6, 20, true), vec3(0, 18.2, 0), TOWER_RED);      // cap
     mesh.combine(buildSphere(.4, 8, 4, true), vec3(0, 19.1, 0), iron);             // finial
@@ -420,17 +465,29 @@ function buildLighthouse()
     towerObject = new EngineObject3D(vec3(0, SHELF_Y, 0), mesh);
     towerObject.specular = .25;
 
-    // the keeper's lamps behind two of the tower's windows
+    // the keeper's lamps behind some of the tower's windows, and the lamp over the door
     const windows = new Mesh;
-    for (const [y, a] of [[7.5, 0], [11.9, .7]])
-        windows.combine(buildBox(vec3(.55, .85, .25)), buildMatrix(vec3(radiusAt(y)*Math.sin(a), y, radiusAt(y)*Math.cos(a)), vec3(0, a, 0)));
+    for (const [y, a, lit] of TOWER_WINDOWS)
+        lit && windows.combine(buildBox(vec3(.55, .85, .3)), buildMatrix(vec3((radiusAt(y) - .05)*Math.sin(a), y, (radiusAt(y) - .05)*Math.cos(a)), vec3(0, a, 0)));
+    windows.combine(buildSphere(.3, 6, 4), vec3(0, 3.55, radiusAt(3.55) + .1));
     const lit = new EngineObject3D(vec3(0, SHELF_Y, 0), windows, undefined, WINDOW_COLOR);
     lit.emissive = 1.2;
+
+    // a dry stone wall round the crown, open in front of the door and where the cottage stands
+    const wall = new Mesh, random = new RandomGenerator(3);
+    for (let a = 0; a < 2*PI; a += .19)
+    {
+        const x = 4.85*Math.sin(a), z = 4.85*Math.cos(a), h = random.float(.45, .75);
+        if (Math.abs(Math.atan2(Math.sin(a), Math.cos(a))) < .45 || Math.hypot(x - PAD.x, z - PAD.z) < PAD.r - .3) continue;
+        wall.combine(buildBox(vec3(random.float(.75, 1), h, random.float(.35, .5))),
+            buildMatrix(vec3(x, h/2, z), vec3(0, a + random.float(-.12, .12), 0)), ROCK_COLOR.scale(random.float(1, 1.5), 1));
+    }
+    new EngineObject3D(vec3(0, SHELF_Y, 0), wall);
 
     // the glass, lit from inside: drawn in its own warm color, bright enough to bloom
     lanternObject = new EngineObject3D(vec3(0, LANTERN_Y, 0), buildCylinder(3, 3, 16, true), undefined, LANTERN_COLOR);
     lanternObject.emissive = 1.6;
-    lanternLight = new Light3D(vec3(0, LANTERN_Y, 0), 30, LANTERN_COLOR, 2);
+    lanternLight = new Light3D(vec3(0, LANTERN_Y, 0), 85, LANTERN_COLOR, 1.05);
 }
 
 // the keeper's cottage beside the tower: stone walls, a slate roof and one warm window
@@ -443,16 +500,27 @@ function buildCottage()
     const roof = buildBox(vec3(3.5, 3.5, 4.1), .05).transform(buildMatrix(vec3(), vec3(0, 0, PI/4)));
     mesh.combine(roof.transform(buildMatrix(vec3(0, 2.8, 0), undefined, vec3(1, .45, 1))), undefined, rgb(.22,.24,.3));
     mesh.combine(buildBox(vec3(.6, 1.6, .6)), vec3(1.3, 3.7, .6), rgb(.5,.47,.44)); // chimney
+    mesh.combine(buildBox(vec3(4.8, .5, 3.8)), vec3(0, .25, 0), rgb(.45,.44,.44));  // a footing of darker stone
+    mesh.combine(buildBox(vec3(.9, 1.8, .14)), vec3(-1.25, .9, 1.8), rgb(.24,.17,.13)); // the door
+    mesh.combine(buildBox(vec3(1.25, 1.05, .14)), vec3(.8, 1.5, 1.78), rgb(.3,.3,.33)); // window frames
+    mesh.combine(buildBox(vec3(.14, 1.05, 1.15)), vec3(2.28, 1.5, -.3), rgb(.3,.3,.33));
     const cottage = new EngineObject3D(pos, mesh);
     cottage.rotation3D = vec3(0, yaw, 0);
 
-    // the window on the side that faces the sea and the camera
-    const front = vec3(Math.sin(yaw), 0, Math.cos(yaw));
-    const windowPos = pos.add(front.scale(1.82)).add(vec3(0, 1.5, 0));
-    const pane = new EngineObject3D(windowPos, buildBox(vec3(1, .8, .06)), undefined, WINDOW_COLOR);
-    pane.rotation3D = vec3(0, yaw, 0);
-    pane.emissive = 1.3;
-    cottageLight = new Light3D(windowPos.add(front.scale(1.2)), 9, WINDOW_COLOR, 1);
+    // warm windows, one facing the sea and the camera and one round the side
+    const panes = buildBox(vec3(1, .8, .16)).transform(buildMatrix(vec3(.8, 1.5, 1.8)));
+    panes.combine(buildBox(vec3(.16, .8, .9)), vec3(2.3, 1.5, -.3));
+    const lit = new EngineObject3D(pos, panes, undefined, WINDOW_COLOR);
+    lit.rotation3D = vec3(0, yaw, 0);
+    lit.emissive = 1.3;
+    // a place in the cottage's own frame out in the world: its front is +z turned by yaw
+    const world = (x, y, z) => pos.add(vec3(x*Math.cos(yaw) + z*Math.sin(yaw), y, z*Math.cos(yaw) - x*Math.sin(yaw)));
+    cottageLight = new Light3D(world(.8, 1.5, 3), 9, WINDOW_COLOR, 1);
+
+    // the keeper's fire: smoke from the chimney, torn off downwind, lit by the lightning as the clouds are
+    const smoke = new ParticleEmitter3D(world(1.3, 4.6, .6), .3, 0, 10, .3, sprayTiles[0],
+        rgb(.55,.55,.6,.4), rgb(.45,.45,.52,.3), rgb(.5,.5,.56,0), rgb(.5,.5,.56,0), 2.6, .7, 3.4, .035, .98, .0003, .3, .3);
+    smoke.gravityScale = 1, smoke.angleSpeed = .01;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -682,20 +750,23 @@ function makeSplash(pos, big)
 {
     const k = big ? 1.4 : 1, white = rgb(1,1,1,.95), blue = rgb(.85,.92,1,.9), clear = rgb(.9,.95,1,0);
     const at = vec3(pos.x, pos.y, pos.z);
-    const emit = (rate, cone, size0, size1, life, speed, gravity, damping, colorA, colorB, seconds=.1) =>
+    const emit = (tile, rate, cone, size0, size1, life, speed, gravity, damping, colorA, colorB, seconds=.1) =>
     {
-        const e = new ParticleEmitter3D(at, 1.5*k, seconds, rate, cone, puffTile, colorA, colorB, clear, clear,
+        const e = new ParticleEmitter3D(at, 1.5*k, seconds, rate, cone, tile, colorA, colorB, clear, clear,
             life, size0, size1, speed, damping, gravity, .3, .4);
         e.emissive = .4;
         return e;
     };
-    const crown = emit(2400*k, PI/3, 1.1, .6, 1.7, .44*k, -.009, .99, white, blue);
+    const crown = emit(puffTile, 2400*k, PI/3, 1.1, .6, 1.7, .44*k, -.009, .99, white, blue);
     crown.trailTime = .08;
-    const column = emit(700*k, PI/16, 1.5, .8, 1.8, .6*k, -.009, .99, white, blue);
+    const column = emit(puffTile, 700*k, PI/16, 1.5, .8, 1.8, .6*k, -.009, .99, white, blue);
     column.trailTime = .06;
-    const mist = emit(400*k, PI/2.5, 3*k, 10*k, 2.4, .17, .0006, .965, rgb(1,1,1,.18), rgb(.8,.85,.95,.12), .15);
-    mist.emitSize = 5*k;
-    mist.roundLighting = true, mist.gravityScale = 1;
+    // the body of the water thrown up, torn sheets of it turning as they rise and fall back
+    const body = emit(sprayTiles[randInt(4)], 280*k, PI/8, 2.5*k, 8*k, 1.3, .4*k, -.008, .98, rgb(.85,.9,1,.5), rgb(.75,.82,.95,.4));
+    body.angleSpeed = .03, body.emissive = .15;
+    const mist = emit(sprayTiles[randInt(4)], 160*k, PI/2.5, 4*k, 13*k, 2.6, .16, .0006, .965, rgb(.9,.93,1,.22), rgb(.8,.85,.95,.15), .15);
+    mist.emitSize = 5*k, mist.angleSpeed = .008, mist.emissive = .15;
+    mist.gravityScale = 1;
     ripples.push({x: pos.x, z: pos.z, start: time, k});
 }
 
@@ -774,7 +845,7 @@ function cloudPosAt(cloud, t)
 const CLOUD_COLOR = rgb(.8,.84,1);
 const CLOUD_EMISSIVE = .6; // the share of its color a cloud keeps unlit, so the dark side never goes muddy
 const CLOUD_CELL = vec2(512, 256); // each baked shape's cell in the cloud texture
-let clouds, cloudTiles = [], puffTile, glowTile;
+let clouds, cloudTiles = [], puffTile, glowTile, sprayTiles;
 
 // a soft round puff, white fading to clear, for the spray and the mist
 function makePuffTexture()
@@ -789,6 +860,27 @@ function makePuffTexture()
     context.fillStyle = g;
     context.fillRect(0, 0, size, size);
     return new TextureInfo(canvas);
+}
+
+// thrown water and spray: a round patch torn into wisps and holes by noise, a few different ones
+function makeSprayTextures()
+{
+    const size = 128, count = 4, canvas = document.createElement('canvas');
+    canvas.width = size*count, canvas.height = size;
+    const context = canvas.getContext('2d'), image = context.createImageData(size*count, size), data = image.data;
+    for (let v = 0; v < count; ++v)
+    for (let y = 0; y < size; ++y)
+    for (let x = 0; x < size; ++x)
+    {
+        const px = x/size, py = y/size, r = Math.hypot(px - .5, py - .5)*2, o = v*20;
+        const n = islandNoise(px*5 + o, py*5)*.55 + islandNoise(px*11 + o, py*11)*.3 + islandNoise(px*23, py*23 + o)*.15;
+        const i = (y*size*count + v*size + x)*4;
+        data[i] = data[i+1] = data[i+2] = 255;
+        data[i+3] = 255*clamp((1 - r**1.4)*1.8*(n*2 - .5));
+    }
+    context.putImageData(image, 0, 0);
+    const texture = new TextureInfo(canvas);
+    return Array.from({length: count}, (_, v) => new TileInfo(vec2(v*size, 0), vec2(size), texture, 0, 1));
 }
 
 // a light's soft glow, for the lamp and where a bolt meets the sea
@@ -883,6 +975,7 @@ function buildClouds()
         cloudTiles.push(new TileInfo(vec2(v % columns*w, (v/columns | 0)*h), CLOUD_CELL, texture, 0, 1));
     puffTile = makePuffTexture();
     glowTile = makeGlowTexture();
+    sprayTiles = makeSprayTextures();
     clouds = cloudLayout(stormSeed);
 }
 
@@ -1101,20 +1194,28 @@ function sprayBurst(spray, rise)
 {
     const k = clamp(rise/1.6, .6, 1.5), at = vec3(spray.face.x, spray.level, spray.face.z);
     const lean = vec3(SPRAY_LEAN, Math.atan2(WIND_DIR[0], WIND_DIR[1]), 0), clear = rgb(.9,.95,1,0);
-    const emit = (size, seconds, rate, cone, colorA, colorB, life, size0, size1, speed, damping, gravity) =>
+    const emit = (tile, size, seconds, rate, cone, colorA, colorB, life, size0, size1, speed, damping, gravity) =>
     {
-        const e = new ParticleEmitter3D(at, size, seconds, rate, cone, puffTile, colorA, colorB, clear, clear,
+        const e = new ParticleEmitter3D(at, size, seconds, rate, cone, tile, colorA, colorB, clear, clear,
             life, size0, size1, speed, damping, gravity, .3, .4);
         e.rotation3D = lean;
         e.emissive = .35;
         return e;
     };
-    const sheet = emit(vec3(3, .5, 3), .14, 1300*k, PI/6, rgb(1,1,1,.95), rgb(.85,.92,1,.9), 1.4, .65, .35, .32*k, .99, -.008);
+    const white = rgb(1,1,1,.95), blue = rgb(.85,.92,1,.9);
+    // the body of white water climbing the rock, torn sheets turning as they go over
+    const body = emit(sprayTiles[randInt(4)], vec3(2.5, .4, 2.5), .12, 150*k, PI/7, rgb(.85,.9,1,.5), rgb(.75,.82,.95,.4), 1, 1.6*k, 5.5*k, .2*k, .975, -.0055);
+    body.angleSpeed = .03, body.gravityScale = .6, body.emissive = .12;
+    // drops flung clear of it, streaking as they fall, fine ones and a few heavy
+    const sheet = emit(puffTile, vec3(3, .5, 3), .14, 1100*k, PI/6, white, blue, 1.4, .5, .28, .32*k, .99, -.008);
     sheet.trailTime = .05, sheet.gravityScale = .5;
-    const mist = emit(3, .2, 110*k, PI/3, rgb(1,1,1,.35), rgb(.85,.9,1,.3), 2.6, 3.5*k, 12*k, .1*k, .965, .0005);
-    mist.roundLighting = true, mist.gravityScale = 1;
-    const foam = emit(vec3(4, .3, 4), .15, 90*k, PI/2.2, rgb(1,1,1,.8), rgb(.9,.95,1,.7), 1.4, 1.5, 4, .05, .95, -.002);
-    foam.gravityScale = .3;
+    const heavy = emit(puffTile, vec3(2, .5, 2), .1, 250*k, PI/5, white, blue, 1.6, 1, .6, .26*k, .992, -.008);
+    heavy.trailTime = .07, heavy.gravityScale = .3;
+    // the spray the wind carries off, and the foam churning at the rock's foot
+    const mist = emit(sprayTiles[randInt(4)], 3, .2, 55*k, PI/3, rgb(.9,.93,1,.22), rgb(.8,.86,1,.16), 2.6, 3.5*k, 12*k, .1*k, .965, .0005);
+    mist.angleSpeed = .008, mist.gravityScale = 1, mist.emissive = .15;
+    const foam = emit(sprayTiles[randInt(4)], vec3(4, .3, 4), .15, 60*k, PI/2.2, rgb(.85,.9,1,.5), rgb(.75,.82,.95,.4), 1.4, 2, 5, .05, .95, -.002);
+    foam.gravityScale = .3, foam.emissive = .12;
 }
 
 function updateSpray()
@@ -1245,11 +1346,11 @@ function gameInit()
     render3D.ambientColor = AMBIENT_COLOR.copy();
     render3D.ambientGroundColor = rgb(.06,.08,.14);
     buildSea();
+    buildClouds(); // first: its textures are the spray and the smoke too
     buildIsland();
     buildLighthouse();
     buildCottage();
     buildLightning();
-    buildClouds();
     buildBeams();
     rain = new Rain;
     buildSpray();
