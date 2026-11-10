@@ -2,7 +2,7 @@
 // seconds and dies away smoothly, neither with a steady flutter on it, and the wait after the flash by distance.
 import {loadBlock, check, done} from './block.mjs';
 
-const {thunderCrack, thunderRoll, thunderDelay, SOUND_RATE} = loadBlock('SOUND');
+const {thunderCrack, thunderRoll, thunderDelay, thunderLoudness, SOUND_RATE} = loadBlock('SOUND');
 
 // loudness of a stretch of a sound, as a root mean square
 const rms = (d, a, b) => { let q = 0; a = a*SOUND_RATE | 0, b = Math.min(d.length, b*SOUND_RATE | 0); for (let i = a; i < b; ++i) q += d[i]*d[i]; return Math.sqrt(q/(b - a)); };
@@ -34,7 +34,11 @@ for (let lag = 3; lag <= 40; ++lag)
 check(flutter < .45, `the roll has no steady flutter on it (${flutter.toFixed(2)})`);
 check(JSON.stringify([...thunderCrack(1).slice(0, 2000)]) === JSON.stringify([...crack.slice(0, 2000)]), 'the same seed gives the same thunder');
 check(JSON.stringify([...thunderRoll(2).slice(0, 2000)]) !== JSON.stringify([...roll.slice(0, 2000)]), 'another seed another');
-check(thunderDelay(100) >= .5 && thunderDelay(100) <= 1.2, `a strike 100m off is heard about a second after it is seen (${thunderDelay(100).toFixed(2)}s)`);
+check(thunderDelay(100) >= .4 && thunderDelay(100) <= .8, `a strike 100m off is heard a good half second after it is seen (${thunderDelay(100).toFixed(2)}s)`);
+const loud = thunderLoudness;
+check(loud(60).crack > loud(300).crack*8 && loud(60).roll > loud(300).roll*3, 'thunder close by is far louder than thunder far off');
+check(loud(300).roll/loud(60).roll > loud(300).crack/loud(60).crack*2, 'and the crack fades faster than the roll, so far thunder is mostly roll');
+check(loud(0).crack <= 1 && loud(0).roll <= 1 && loud(1e4).roll >= 0, 'between nothing and full');
 check(thunderDelay(30) >= .3 && thunderDelay(30) < thunderDelay(100) && thunderDelay(100) < thunderDelay(200), 'nearer sooner, further later');
 check(thunderDelay(5000) <= 2.5, 'never so late it comes loose from its flash');
 done('sound');

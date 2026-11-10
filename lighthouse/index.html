@@ -254,10 +254,6 @@ ${SKERRIES.map(k => `    ring = max(ring, smoothstep(2.3, 1.2, length(p - vec2($
     // foam is lace, not paint: holes open in it along the lines of a finer noise
     float lace = abs(seaNoise(p*1.7 + vec2(iTime*.2, iTime*.1)) - .5)*2.;
     foam *= mix(.35, 1., smoothstep(.05, .3, lace + foam*.25));
-    // old foam drawn out into long streaks down the wind, faint, broken by the same noise
-    vec2 q = vec2(dot(p, WIND), dot(p, vec2(-WIND.y, WIND.x)));
-    float streak = seaNoise(vec2(q.x*.05 - iTime*.25, q.y*.45)) * seaNoise(vec2(q.x*.11, q.y*.9 + 3.));
-    foam = max(foam, smoothstep(.3, .55, streak)*.3*smoothstep(.2, .6, n));
     // the troughs deep, the crests lit through with a little green as a wave's thin top is
     float h = clamp((worldPos.y + CREST)/(2.*CREST), 0., 1.);
     vec3 body = mix(vec3(.7,.74,.88), vec3(1.2,1.45,1.3), h*h);
@@ -266,18 +262,20 @@ ${SKERRIES.map(k => `    ring = max(ring, smoothstep(2.3, 1.2, length(p - vec2($
 }
 void mainNormal(inout vec3 n)
 {
-    // the short swell the grid can't carry, then the chop: each small wave fades out where it would be finer than
-    // the picture can show, and a slow noise slides their phases about so they never line up into a pattern
+    // the short swell the grid can't carry, then the chop. Each small wave is only drawn where the picture can show
+    // it: seen at a shallow angle a ripple is many pixels wide and less than one tall, and drawn anyway it breaks
+    // up into flat flickering dashes. So each fades out as it nears the size of a pixel across the water, measured
+    // the worse way, up the screen. A slow noise slides their phases about so they never line up into a pattern
     vec2 p = worldPos.xz, s = seaSlope(p, ${SEA_DISPLACED}, ${WAVES.length});
-    float d = distance(cameraPos, worldPos), warp = seaNoise(p*.06 + iTime*.02)*6.283;
+    float pixel = max(length(dFdx(p)), length(dFdy(p))), warp = seaNoise(p*.06 + iTime*.02)*6.283;
     for (int i = 0; i < ${CHOP.length}; ++i)
     {
         float a = CHOP[i].z*dot(CHOP[i].xy, p) - CHOP[i].w*iTime + warp*(1. + float(i)*.6);
-        s += CHOP[i].xy*(.085*cos(a)*clamp(150./(CHOP[i].z*d) - .3, 0., 1.));
+        s += CHOP[i].xy*(.085*cos(a)*clamp(1.2/(CHOP[i].z*pixel) - 1., 0., 1.));
     }
-    // the rain: the water near the lens stippled with drops, new ones every few frames
+    // the rain: the water right under the lens stippled with drops, new ones every few frames
     float t = floor(iTime*15.);
-    s += clamp(1. - d/40., 0., 1.)*.4*(vec2(seaNoise(p*8. + t*13.7), seaNoise(p.yx*8. + t*5.3 + 40.)) - .5);
+    s += clamp(.03/pixel - 1., 0., 1.)*.25*(vec2(seaNoise(p*8. + t*13.7), seaNoise(p.yx*8. + t*5.3 + 40.)) - .5);
     n = normalize(n + vec3(-s.x, 0., -s.y));
 }`, `${SEA_GLSL_COMMON}
 void mainVertex(inout vec3 pos, inout vec3 normal)
@@ -1393,49 +1391,58 @@ function thunderCrack(seed)
 {
     const white = soundNoise(seed), random = soundNoise(seed + 77), n = SOUND_RATE*.9 | 0, out = new Float32Array(n);
     // the snap, and after it a dozen or so lesser ones at uneven times, thinning out and weakening
-    const snaps = [{t: 0, gain: 1, fall: .05}];
+    const snaps = [{t: 0, gain: 1.6, fall: .005}, {t: 0, gain: 1, fall: .06}];
     for (let t = .02; t < .55; t += .012 + (random() + 1)*.035)
-        snaps.push({t, gain: (.25 + .3*(random() + 1))*Math.exp(-t/.22), fall: .008 + .012*(random() + 1)});
-    // everything under 150Hz taken out and a little off the very top, so it is a crack and not a thud or a hiss
-    const top = 1 - Math.exp(-2*Math.PI*7500/SOUND_RATE), bottom = 1 - Math.exp(-2*Math.PI*150/SOUND_RATE);
-    let pass = 0, under = 0;
+        snaps.push({t, gain: (.25 + .3*(random() + 1))*Math.exp(-t/.22), fall: .006 + .012*(random() + 1)});
+    // everything under 250Hz taken out, so it is a crack and not a thud, and all the top left in for its edge
+    const bottom = 1 - Math.exp(-2*Math.PI*250/SOUND_RATE);
+    let under = 0;
     for (let i = 0; i < n; ++i)
     {
-        const t = i/SOUND_RATE;
+        const t = i/SOUND_RATE, v = white();
         let loud = 0;
         for (const k of snaps) t >= k.t && (loud += k.gain*Math.exp(-(t - k.t)/k.fall));
-        pass += top*(white() - pass), under += bottom*(pass - under);
-        out[i] = (pass - under)*loud;
+        under += bottom*(v - under);
+        out[i] = (v - under)*loud;
     }
-    return soundFinish(out, 2.5);
+    return soundFinish(out, 3);
 }
 
 function thunderRoll(seed)
 {
-    const white = soundNoise(seed + 13), random = soundNoise(seed + 200), seconds = 7, n = SOUND_RATE*seconds | 0;
+    const white = soundNoise(seed + 13), random = soundNoise(seed + 200), seconds = 9, n = SOUND_RATE*seconds | 0;
     const out = new Float32Array(n);
     // the peals: a loudness that wanders, a new random height every third of a second or so, eased between
     const peals = Array.from({length: seconds*3 + 2}, () => .5 + .5*random());
-    const bottom = 1 - Math.exp(-2*Math.PI*35/SOUND_RATE);
-    let pass = 0, pass2 = 0, under = 0;
+    const bottom = 1 - Math.exp(-2*Math.PI*30/SOUND_RATE), deep = 1 - Math.exp(-2*Math.PI*75/SOUND_RATE);
+    let pass = 0, pass2 = 0, under = 0, low = 0, low2 = 0;
     for (let i = 0; i < n; ++i)
     {
-        const t = i/SOUND_RATE, cut = 140 + 2400*Math.exp(-t/.8); // bright at first, then only the low rumble
+        const t = i/SOUND_RATE, cut = 90 + 2400*Math.exp(-t/.7); // bright at first, then only the low rumble
         const a = 1 - Math.exp(-2*Math.PI*cut/SOUND_RATE), p = t*3, k = p | 0, e = p - k;
-        const peal = peals[k] + (peals[k+1] - peals[k])*e*e*(3 - 2*e);
-        pass += a*(white() - pass), pass2 += a*(pass - pass2), under += bottom*(pass2 - under);
-        // darker noise is quieter noise, so it is lifted to keep the rumble's body as the hiss goes
-        const loud = Math.min(1, t/.03)*Math.exp(-t/1.7)*(.45 + .55*peal)*Math.min(1, (seconds - t)/.6)*(2540/cut)**.45;
-        out[i] = (pass2 - under)*loud;
+        const peal = peals[k] + (peals[k+1] - peals[k])*e*e*(3 - 2*e), v = white();
+        pass += a*(v - pass), pass2 += a*(pass - pass2), under += bottom*(pass2 - under);
+        low += deep*(v - low), low2 += deep*(low - low2); // and under it all a deep body that outlasts the rest
+        // darker noise is quieter noise, so it is lifted to keep the rumble's weight as the hiss goes
+        const fade = Math.min(1, t/.03)*Math.min(1, (seconds - t)/.8);
+        out[i] = fade*((pass2 - under)*Math.exp(-t/2.2)*(.25 + .75*peal)*(2490/cut)**.6 + low2*9*Math.exp(-t/3));
     }
     return soundFinish(out, 2);
 }
 
-// how long after its flash a strike is heard, seconds for its distance in meters: sound takes its time, and
-// stretched a little here so even a near strike has the beat between the light and the sound
+// how long after its flash a strike is heard, seconds for its distance in meters: sound takes its time, a little
+// more than its true third of a second a hundred meters here, so a strike keeps the beat between light and sound
 function thunderDelay(distance)
 {
-    return Math.min(.35 + distance/150, 2.2);
+    return Math.min(.2 + distance/230, 1.6);
+}
+
+// how loud a strike is from a distance: thunder close by is a blow and far off a mutter. The crack fades fastest,
+// since it is the sound come straight, and the roll carries, so a far strike is nearly all roll
+function thunderLoudness(distance)
+{
+    const near = 1/(1 + (distance/100)**2);
+    return {crack: near**1.4, roll: near**.75};
 }
 // SOUND END
 
@@ -1491,8 +1498,8 @@ function buildSounds()
 function queueThunder(kind, pos, big)
 {
     if (recordMode) return;
-    const distance = render3D.camera.pos.distance(pos), near = 1/(1 + distance/300), size = big ? 1 : .7;
-    thunderDue.push({at: time + thunderDelay(distance), crack: (kind == 'cloud' ? .45 : 1)*near*size*1.5, roll: near*size*1.3});
+    const distance = render3D.camera.pos.distance(pos), loud = thunderLoudness(distance), size = big ? 1 : .7;
+    thunderDue.push({at: time + thunderDelay(distance), crack: loud.crack*(kind == 'cloud' ? .5 : 1)*size*3, roll: loud.roll*size*2.2});
 }
 
 function updateSound()

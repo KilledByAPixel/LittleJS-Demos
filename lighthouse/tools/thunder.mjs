@@ -8,7 +8,7 @@ import {loadBlock} from './block.mjs';
 const [out, seconds = 30] = process.argv.slice(2);
 if (!out) { console.error('usage: node thunder.mjs <out.wav> [seconds]'); process.exit(1); }
 
-const {thunderCrack, thunderRoll, thunderDelay, SOUND_RATE} = loadBlock('SOUND');
+const {thunderCrack, thunderRoll, thunderDelay, thunderLoudness, SOUND_RATE} = loadBlock('SOUND');
 const {makeSchedule, CLOUD_BASE_Y} = loadBlock('LIGHTNING');
 const {cameraPathAt} = loadBlock('CAMERA', {vec3: (x=0, y=0, z=0) => ({x, y, z})});
 
@@ -22,9 +22,9 @@ makeSchedule(() => 0, true).forEach((strike, i) =>
     // as the page's queueThunder: up in the cloud mostly roll, down to the sea a hard crack first, the big one louder
     const camera = cameraPathAt(strike.t).pos, cloud = strike.kind == 'cloud';
     const distance = Math.hypot(strike.x - camera.x, (cloud ? CLOUD_BASE_Y + 8 : 0) - camera.y, strike.z - camera.z);
-    const delay = thunderDelay(distance), near = 1/(1 + distance/300), size = strike.big ? 1 : .7;
-    add(thunderCrack(i % 3 + 1), strike.t + delay, (cloud ? .45 : 1)*near*size*1.5);
-    add(thunderRoll(i % 3 + 1), strike.t + delay, near*size*1.3);
+    const delay = thunderDelay(distance), loud = thunderLoudness(distance), size = strike.big ? 1 : .7;
+    add(thunderCrack(i % 3 + 1), strike.t + delay, loud.crack*(cloud ? .5 : 1)*size*3);
+    add(thunderRoll(i % 3 + 1), strike.t + delay, loud.roll*size*2.2);
     console.log(`strike at ${strike.t}s, ${distance.toFixed(0)}m off, heard ${delay.toFixed(2)}s later`);
 });
 
