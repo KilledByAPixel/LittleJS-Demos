@@ -390,9 +390,67 @@ const LANTERN_COLOR = rgb(1,.82,.56), WINDOW_COLOR = rgb(1,.69,.38);
 const TOWER_WINDOWS = [[7.5, 0, true], [11.9, .7, true], [3.1, -1.2, false], [7.5, 2.3, false], [11.9, -1.7, true], [3.1, 1.6, true]];
 let islandObject, towerObject, lanternObject, lanternLight, cottageLight;
 
-// the island's mesh: the height above cut into small flat facets, for the clean stylized look, each colored by
-// where it is - the rock's own bands, lighter on the level ledges, grass on the crown and in the hollows, dark and
-// wet where the swells wash and weed at the waterline
+// the rock's surface, worked out once as a square that repeats: a height of sharp ridges at five sizes, fine beds
+// of strata and a web of cracks. Its slopes become the normal map that lights the smooth mesh as broken stone, and
+// its height the grain, darker in the cracks and hollows
+const ROCK_TILE = 9; // meters a repeat
+function makeRockTextures()
+{
+    const size = 512, height = new Float32Array(size*size);
+    const hash = (i, j, p, k) =>
+    {
+        const v = Math.sin(((i % p + p) % p)*127.1 + ((j % p + p) % p)*311.7 + k*74.7)*43758.5453;
+        return v - Math.floor(v);
+    };
+    // smooth noise that repeats every p cells, so the square's edges meet
+    const noise = (x, y, p, k) =>
+    {
+        const i = Math.floor(x), j = Math.floor(y);
+        let fx = x - i, fy = y - j;
+        fx = fx*fx*(3 - 2*fx), fy = fy*fy*(3 - 2*fy);
+        const a = hash(i, j, p, k), b = hash(i + 1, j, p, k), c = hash(i, j + 1, p, k), d = hash(i + 1, j + 1, p, k);
+        return a + (b - a)*fx + (c - a)*fy + (a - b - c + d)*fx*fy;
+    };
+    for (let y = 0; y < size; ++y)
+    for (let x = 0; x < size; ++x)
+    {
+        const u = x/size, v = y/size;
+        let h = 0;
+        for (let o = 0, p = 4, amp = .5; o < 5; ++o, p *= 2, amp *= .55)
+            h += amp*(1 - Math.abs(2*noise(u*p, v*p, p, o) - 1));
+        h += .02*Math.sin(2*PI*(v*22 + noise(u*6, v*6, 6, 9)*4));
+        h -= .4*Math.max(0, 1 - Math.abs(noise(u*7, v*7, 7, 20) - .5)/.03);
+        height[y*size + x] = h;
+    }
+    const make = pixel =>
+    {
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = size;
+        const context = canvas.getContext('2d'), image = context.createImageData(size, size);
+        for (let y = 0; y < size; ++y)
+        for (let x = 0; x < size; ++x)
+            pixel(image.data, (y*size + x)*4, x, y);
+        context.putImageData(image, 0, 0);
+        return new TextureInfo(canvas, true, true);
+    };
+    const at = (x, y) => height[(y + size) % size*size + (x + size) % size];
+    const normal = make((data, i, x, y) =>
+    {
+        // green points up the image, so a height that rises down it leans the normal up
+        const nx = (at(x - 1, y) - at(x + 1, y))*30, ny = (at(x, y + 1) - at(x, y - 1))*30, k = 1/Math.hypot(nx, ny, 1);
+        data[i] = 127.5 + 127.5*nx*k, data[i+1] = 127.5 + 127.5*ny*k, data[i+2] = 127.5 + 127.5*k, data[i+3] = 255;
+    });
+    const grain = make((data, i, x, y) =>
+    {
+        data[i] = data[i+1] = data[i+2] = 255*clamp(.62 + .55*at(x, y));
+        data[i+3] = 255;
+    });
+    return {normal, grain};
+}
+
+// the island's mesh: the height above, smooth, lit as broken stone by the rock's normal map, and colored by where
+// it is - the rock's own bands, lighter on the level ledges, grass on the crown and in the hollows, dark and wet
+// where the swells wash and weed at the waterline
 function buildIsland()
 {
     const moss = rgb(.30,.38,.24), weed = rgb(.12,.16,.14);
@@ -406,11 +464,16 @@ function buildIsland()
         c = c.lerp(moss, grass);
         return c.scale(1 - .5*clamp((2.2 - y)/2.2), 1).lerp(weed, clamp((1 - y)/1.5)*.6);
     };
-    const mesh = buildGrid(vec2(ISLAND_SIZE), 136, color, islandHeightAt, false);
+    const mesh = buildGrid(vec2(ISLAND_SIZE), 136, color, islandHeightAt, true);
     mesh.doubleSided = false;
-    islandObject = new EngineObject3D(vec3(), mesh);
-    islandObject.specular = .4; // wet rock, the lightning glints on it
-    islandObject.shininess = 24;
+    // the rock's square laid across the island leaning with the height, so it doesn't smear down the cliffs
+    mesh.uvs = mesh.points.map(p => vec2((p.x + p.y*.9)/ROCK_TILE, (p.z + p.y*.9)/ROCK_TILE));
+    const {normal, grain} = makeRockTextures();
+    islandObject = new EngineObject3D(vec3(), mesh, grain);
+    islandObject.normalMap = normal;
+    islandObject.normalScale = 1.2;
+    islandObject.specular = .45; // wet rock, the lightning glints on it
+    islandObject.shininess = 28;
 }
 
 // the tower in white and red rings, its gallery, the glass lantern room and the red cap; the room glows on its own.
