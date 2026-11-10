@@ -30,13 +30,13 @@ let stormTime = 0, stormSeed = 1;
 const EYE_MIN = 3;         // never lower than this, or a swell crest would swallow the lens
 const CAM_LOOP = 38;       // the live page's loop, the cinematic's 30 seconds plus the ease home
 const CAM_LEGS = [
-    {t: 0,    pos: [0, 3.5, 68],   target: [0, 10, 0]},
-    {t: 3.5,  pos: [0, 3.5, 68],   target: [0, 10, 0]},
-    {t: 11,   pos: [0, 3.5, 48],   target: [0, 10, 0]},
-    {t: 18.5, pos: [-22, 4.5, 40], target: [2, 10, 0]},
-    {t: 25.5, pos: [-10, 7, 60],   target: [0, 11, 0]},
-    {t: 34,   pos: [-10, 7, 60],   target: [0, 11, 0]},
-    {t: CAM_LOOP, pos: [0, 3.5, 68], target: [0, 9, 0]},
+    {t: 0,    pos: [0, 5, 76],     target: [0, 12, 0]},
+    {t: 3.5,  pos: [0, 5, 76],     target: [0, 12, 0]},
+    {t: 11,   pos: [0, 6, 54],     target: [0, 12, 0]},
+    {t: 18.5, pos: [-26, 9, 44],   target: [2, 12, 0]},
+    {t: 25.5, pos: [-14, 13, 66],  target: [0, 12, 0]},
+    {t: 34,   pos: [-14, 13, 66],  target: [0, 12, 0]},
+    {t: CAM_LOOP, pos: [0, 5, 76], target: [0, 12, 0]},
 ];
 
 function cameraPathAt(t)
@@ -54,6 +54,108 @@ function cameraPathAt(t)
     return {pos: vec3(r*Math.sin(angle), y, r*Math.cos(angle)), target: vec3(mix(0), mix(1), mix(2))};
 }
 // CAMERA END
+
+///////////////////////////////////////////////////////////////////////////////
+// ISLAND BEGIN - the islet's shape, plain math only so node can test it
+//
+// One piece of rock, a height for every place: level on the crown where the tower stands and on the pad beside it
+// for the cottage, then down to the sea in broken ledges, with outcrops standing up out of the slope and a shoreline
+// that wanders in and out. Round it a few skerries break the surface, awash when a swell goes over them. Outside all
+// of it the rock is sunk well under the troughs, so nothing ever shows an edge or floats.
+
+const ISLAND_SIZE = 64;     // meters across the island's mesh
+const SHELF_Y = 6;          // the crown the tower stands on, well clear of the swells
+const CROWN_RADIUS = 5.2;   // the level ground round the tower's foot
+const PAD = {x: 5, z: -3, r: 4.1};      // and the level ground under the cottage
+const SHORE_BASE = 14, SHORE_WAVES = [[2.2, 2, .7], [1.4, 3, 2.1], [.8, 5, 4]]; // amplitude, turns, phase
+const SKERRIES = [
+    {x: -20,  z: 9,   r: 4.2, h: 4.4, turn: .5},
+    {x: 18,   z: 14,  r: 3.4, h: 2.8, turn: 2.2},
+    {x: -11,  z: -21, r: 4.6, h: 5.5, turn: 1.2},
+    {x: 22.5, z: -8,  r: 3,   h: 2.2, turn: .2},
+    {x: 3,    z: 22,  r: 2.6, h: 1.8, turn: 2.8},
+    {x: -17,  z: 15,  r: 2.2, h: 1.5, turn: 1.7},
+];
+
+// smooth noise, 0 to 1, the same for the same place every run
+function islandNoise(x, z)
+{
+    const hash = (i, j) =>
+    {
+        let h = Math.imul(i, 374761393) + Math.imul(j, 668265263) | 0;
+        h = Math.imul(h ^ (h >>> 13), 1274126177);
+        return ((h ^ (h >>> 16)) >>> 0)/4294967296;
+    };
+    const i = Math.floor(x), j = Math.floor(z);
+    let fx = x - i, fz = z - j;
+    fx = fx*fx*(3 - 2*fx), fz = fz*fz*(3 - 2*fz);
+    const a = hash(i, j), b = hash(i + 1, j), c = hash(i, j + 1), d = hash(i + 1, j + 1);
+    return a + (b - a)*fx + (c - a)*fz + (a - b - c + d)*fx*fz;
+}
+
+// how far out the waterline is, looking out from the middle at an angle (0 toward +z, as atan2(x, z))
+function islandShore(angle)
+{
+    let r = SHORE_BASE;
+    for (const [amp, turns, phase] of SHORE_WAVES) r += amp*Math.sin(turns*angle + phase);
+    return r;
+}
+
+function islandHeightAt(x, z)
+{
+    const unit = v => Math.min(Math.max(v, 0), 1);
+    // ledges: a height pulled toward steps down from the crown, flat for most of each and steep between
+    const ledges = (h, step) =>
+    {
+        const k = (h - SHELF_Y)/step, f = k - Math.floor(k), rise = unit((f - .55)/.45);
+        return SHELF_Y + (Math.floor(k) + rise*rise*(3 - 2*rise))*step;
+    };
+    const r = Math.hypot(x, z), shore = islandShore(Math.atan2(x, z));
+    // how far outside the level ground this is, and how far that is of the way to the waterline
+    const out = Math.max(0, Math.min(r - CROWN_RADIUS, Math.hypot(x - PAD.x, z - PAD.z) - PAD.r));
+    const t = out/Math.max(2.5, shore - (r - out)), rough = unit(out/1.5);
+    let y = t < 1 ? SHELF_Y*(1 - t**1.4) : -(t - 1)*9;
+    y += (islandNoise(x*.3, z*.3) - .5)*1.6*rough;
+    y = ledges(y, 1.3) + (islandNoise(x*1.1 + 7, z*1.1) - .5)*.6*rough;
+    // outcrops standing up out of the slope, none on the level ground or out past the shore
+    y += Math.max(0, islandNoise(x*.45 + 31, z*.45 + 17) - .58)*9*unit((out - 1)/2.5)*unit((1.25 - t)/.3);
+    for (const k of SKERRIES)
+    {
+        // a long jagged tooth of rock: narrow across its length, steep sided, its crest broken into ridges and
+        // notches by the noise so no two faces match
+        const c = Math.cos(k.turn), s = Math.sin(k.turn), dx = x - k.x, dz = z - k.z;
+        const d = Math.hypot(dx*c + dz*s, (dz*c - dx*s)*1.9)/k.r;
+        if (d > 1.7) continue;
+        const ridge = 1 - Math.abs(2*islandNoise(x*.7 + 50, z*.7) - 1), chip = islandNoise(x*1.9 + 9, z*1.9);
+        let h = d < 1 ? k.h*(1 - d**1.3)*(.45 + .85*ridge) + (chip - .5)*.7*unit(d*3) : -(d - 1)*8;
+        d < .25 && (h = Math.max(h, k.h*.6)); // its middle always stands clear of the water
+        y = Math.max(y, ledges(h + .2, .45));
+    }
+    return Math.max(y, -6);
+}
+
+// where the swells break on the rock: points on the waterline on the side the wind comes from, the island's own
+// shore and the upwind faces of the skerries
+function islandSprayPoints(windX, windZ)
+{
+    const points = [], upwind = Math.atan2(-windX, -windZ);
+    const land = (x, z, dx, dz) =>
+    {
+        // out from inside the rock, against the wind, to where it goes under
+        let d = 0;
+        while (d < 20 && islandHeightAt(x + dx*d, z + dz*d) > .3) d += .1;
+        points.push({x: x + dx*d, z: z + dz*d});
+    };
+    for (const turn of [-1, -.5, 0, .5, 1])
+    {
+        const a = upwind + turn, r = islandShore(a)*.6;
+        land(Math.sin(a)*r, Math.cos(a)*r, Math.sin(a), Math.cos(a));
+    }
+    for (const k of SKERRIES)
+        if (k.x*windX + k.z*windZ < 0) land(k.x, k.z, -windX, -windZ);
+    return points;
+}
+// ISLAND END
 
 ///////////////////////////////////////////////////////////////////////////////
 // SEA BEGIN - the waves, plain math only so node can test it
@@ -92,7 +194,6 @@ function seaHeightAt(x, z, t)
 
 const SEA_SIZE = 1000, SEA_SEGMENTS = 320;  // meters across and cells a side, about 3m a cell
 const SEA_COLOR = rgb(.06,.19,.28), FOAM_COLOR = rgb(.78,.83,.85);
-const ROCK_FOAM_RADIUS = 16;                // foam churns this far out from the island's middle
 const FOG_START = 90, FOG_END = 380, FOG_COLOR = rgb(.17,.18,.36);
 const SUN_AZIMUTH = -.6;                    // where the last of the light is, left of the first shot's view
 const AMBIENT_COLOR = rgb(.30,.34,.55), AMBIENT_FLASH = rgb(.22,.25,.42);
@@ -134,7 +235,9 @@ void mainImage(out vec4 c, vec2 uv)
     vec2 p = worldPos.xz;
     float n = seaNoise(p*.35 + vec2(iTime*.3, 0.))*.6 + seaNoise(p*1.3 - vec2(0., iTime*.5))*.4;
     float crest = smoothstep(.5*CREST, .9*CREST, worldPos.y + (n - .5)*.5);
-    float ring = smoothstep(${ROCK_FOAM_RADIUS.toFixed(1)}, 9., length(p) + (n - .5)*7.);
+    float shore = ${SHORE_BASE.toFixed(2)}${SHORE_WAVES.map(([amp, turns, phase]) => ` + ${amp.toFixed(2)}*sin(${turns.toFixed(1)}*atan(p.x, p.y) + ${phase.toFixed(2)})`).join('')};
+    float ring = smoothstep(1.7, 1.05, length(p)/shore + (n - .5)*.5);
+${SKERRIES.map(k => `    ring = max(ring, smoothstep(2.3, 1.2, length(p - vec2(${k.x.toFixed(1)}, ${k.z.toFixed(1)}))/${k.r.toFixed(1)} + (n - .5)*.7));`).join('\n')}
     float foam = clamp(max(crest*smoothstep(.35, .7, n), ring*smoothstep(.25, .6, n + ring*.3)), 0., 1.);
     // old foam drawn out into long streaks down the wind, faint, broken by the same noise
     vec2 q = vec2(dot(p, WIND), dot(p, vec2(-WIND.y, WIND.x)));
@@ -256,75 +359,31 @@ function buildSea()
     sea.reflectivity = .35;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// ISLAND BEGIN - where the rocks lie, plain math only so node can test it
-//
-// The islet is a rocky mound with the lighthouse on its crown; round it lie a few big tilted slabs and a jumble of
-// boulders, some sunk deep so the swells break over them. Seeded, so every run and every recording is the same rock.
-
-const ISLAND_RADIUS = 12;   // no rock reaches further from the middle than this
-const SHELF_Y = 4;          // the crown the tower stands on, high enough to stand clear of the swells
-
-function rockLayout(seed)
-{
-    let s = (seed*2654435761 >>> 0) || 1;
-    const random = (a=0, b=1) => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return a + (b - a)*(s >>> 0)/4294967296; };
-    const rocks = [];
-    const place = (radiusMin, radiusMax, size, y, kind) =>
-    {
-        const angle = random(0, 2*Math.PI), r = random(radiusMin, radiusMax);
-        const reach = Math.max(size[0], size[2])/2*.7; // keep the rock's own bulk inside the island too
-        const d = Math.min(r, ISLAND_RADIUS - reach);
-        rocks.push({kind, x: Math.sin(angle)*d, y, z: Math.cos(angle)*d, sx: size[0], sy: size[1], sz: size[2],
-            yaw: random(0, Math.PI), pitch: random(-.3, .3)});
-    };
-    // slabs leaning out from the mound, the island's big shapes
-    const slabs = 3 + (random()*3 | 0);
-    for (let i = 0; i < slabs; ++i)
-        place(5, 8, [random(6, 9), random(2, 3), random(4, 6)], random(.5, 2.1), 'slab');
-    // sunk foundations the swells foam over
-    for (let i = 0; i < 4; ++i)
-        place(7, 11, [random(3, 5), 3.5, random(3, 5)], -2.6, 'boulder');
-    // the jumble
-    const boulders = 10 + (random()*7 | 0);
-    for (let i = 0; i < boulders; ++i)
-    {
-        const size = random(1.5, 3.6);
-        place(4, 11.5, [size*random(.9, 1.4), size*random(.6, 1), size*random(.9, 1.4)], random(-.5, 2.5), 'boulder');
-    }
-    return rocks;
-}
-// ISLAND END
-
 const LANTERN_Y = SHELF_Y + 15.5, TOWER_HEIGHT = SHELF_Y + 20.7; // the middle of the lantern room, and the rod's tip
 const ROCK_COLOR = rgb(.36,.37,.40), TOWER_WHITE = rgb(.92,.92,.95), TOWER_RED = rgb(.75,.18,.15);
 const LANTERN_COLOR = rgb(1,.82,.56), WINDOW_COLOR = rgb(1,.69,.38);
 let islandObject, towerObject, lanternObject, lanternLight, cottageLight;
 
-// one mesh of every rock and the mound under the tower, flat shaded and faceted for the clean stylized look
+// the island's mesh: the height above cut into small flat facets, for the clean stylized look, each colored by
+// where it is - the rock's own bands, lighter on the level ledges, grass on the crown and in the hollows, dark and
+// wet where the swells wash and weed at the waterline
 function buildIsland()
 {
-    const mesh = buildLathe([[0, -5], [10.5, -5], [9, -1.5], [7.5, 1.4], [6, SHELF_Y - .3], [4.8, SHELF_Y], [0, SHELF_Y]], 9, false);
-    mesh.setColor(ROCK_COLOR.scale(.9, 1));
-    const slab = buildBox(1, .12, 1), boulder = buildSphere(1, 7, 4, false);
-    let k = 0;
-    for (const r of rockLayout(1))
+    const moss = rgb(.30,.38,.24), weed = rgb(.12,.16,.14);
+    const color = (x, z) =>
     {
-        const shade = .85 + .3*((k++*.618) % 1);
-        const matrix = buildMatrix(vec3(r.x, r.y, r.z), vec3(r.pitch, r.yaw, r.pitch*.5), vec3(r.sx, r.sy, r.sz));
-        mesh.combine(r.kind == 'slab' ? slab : boulder, matrix, ROCK_COLOR.scale(shade, 1));
-    }
-    // shaded by height: dark and wet where the swells wash, grass where the crown is level
-    const moss = rgb(.33,.40,.26);
-    for (let i = 0; i < mesh.colors.length; ++i)
-    {
-        const p = mesh.points[i], n = mesh.normals[i], c = mesh.colors[i];
-        const wet = 1 - .4*Math.max(0, Math.min(1, (1.6 - p.y)/2.2));
-        const grass = p.y > SHELF_Y - .45 && n && n.y > .75 ? .85 : 0;
-        mesh.colors[i] = rgb(c.r*wet, c.g*wet, c.b*wet, 1).lerp(moss, grass);
-    }
+        const y = islandHeightAt(x + .2, z + .2);
+        const slope = Math.hypot(islandHeightAt(x + .6, z + .2) - y, islandHeightAt(x + .2, z + .6) - y)/.4;
+        const n = islandNoise(x*.9 + 3, z*.9), band = islandNoise(y*1.7 + 20, (x + z)*.08);
+        let c = ROCK_COLOR.scale((.7 + .35*n + .3*(band - .5))*(slope < .5 ? 1.15 : 1), 1);
+        const grass = y > SHELF_Y - .1 && slope < .3 ? .8 : slope < .5 && y > 2 ? .5*n : 0;
+        c = c.lerp(moss, grass);
+        return c.scale(1 - .5*clamp((2.2 - y)/2.2), 1).lerp(weed, clamp((1 - y)/1.5)*.6);
+    };
+    const mesh = buildGrid(vec2(ISLAND_SIZE), 136, color, islandHeightAt, false);
+    mesh.doubleSided = false;
     islandObject = new EngineObject3D(vec3(), mesh);
-    islandObject.specular = .35; // wet rock, the lightning glints on it
+    islandObject.specular = .4; // wet rock, the lightning glints on it
     islandObject.shininess = 24;
 }
 
@@ -377,7 +436,7 @@ function buildLighthouse()
 // the keeper's cottage beside the tower: stone walls, a slate roof and one warm window
 function buildCottage()
 {
-    const yaw = -.5, pos = vec3(4.1, SHELF_Y, -2.4);
+    const yaw = -.5, pos = vec3(PAD.x, SHELF_Y, PAD.z);
     const mesh = buildBox(vec3(4.6, 2.8, 3.6), .08).setColor(rgb(.72,.70,.66));
     mesh.transform(buildMatrix(vec3(0, 1.4, 0)));
     // the roof: a long box turned on its edge, then squashed, so its gable overhangs the walls all round
@@ -658,52 +717,63 @@ function drawRipples()
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// CLOUDS BEGIN - where the cloud puffs are and how they drift, plain math only so node can test it
+// CLOUDS BEGIN - where the clouds are and how they drift, plain math only so node can test it
 //
-// The storm's deck: banks of big lumpy puffs in three layers low over the sea, the lowest at the base the lightning
-// comes out of, with the evening sky showing between the banks. Each layer drifts downwind at its own pace and wraps
-// round inside a box centered on the island, so the sky never empties.
+// The storm's sky: big clouds low over the sea, one sprite each, in two decks. The low deck has its feet near the
+// base the lightning comes out of; the high deck is bigger, darker clouds well above it, filling the sky behind. In
+// a deck the clouds stand on a loose grid, far enough apart that two the same distance from the camera never
+// overlap by more than their thin ends, since that is where the draw order between them can change and a change
+// shows as a pop; the decks are too far apart in height to meet. Everything drifts downwind as one and wraps round
+// inside a box centered on the island, each cloud fading out toward the box's edge so the wrap is never seen.
 
-const CLOUD_BOX = 440, CLOUD_BANKS = 22, CLOUD_VARIANTS = 4;
-const CLOUD_LAYERS = [CLOUD_BASE_Y, CLOUD_BASE_Y + 10, CLOUD_BASE_Y + 21];
-const CLOUD_SPEEDS = [1.5, 2.2, 3];   // meters a second, the higher layers faster
+const CLOUD_BOX = 560, CLOUD_VARIANTS = 6;
+const CLOUD_DECKS = [   // clouds a side, the lowest foot above the base and how much higher a foot may be, size, shade
+    {grid: 6, foot: 0,  rise: 20, size: [.95, 1.2],  shade: 1},
+    {grid: 4, foot: 75, rise: 25, size: [1.05, 1.2], shade: .7},
+];
+const CLOUD_SPEED = 2;      // meters a second downwind
+const CLOUD_FADE = 70;      // a cloud fades out over this far from the box's edge
+const CLOUD_FOOT = .2;      // how far up a cloud's sprite its flat foot is, the rest below is clear
+const CLOUD_BODY = .72;     // and how far up its top can reach
 
 function cloudLayout(seed)
 {
     let s = (seed*2654435761 >>> 0) || 1;
     const random = (a=0, b=1) => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return a + (b - a)*(s >>> 0)/4294967296; };
     const clouds = [];
-    for (let bank = 0; bank < CLOUD_BANKS; ++bank)
+    CLOUD_DECKS.forEach((deck, d) =>
     {
-        // a bank is a loose row of puffs across the wind, big in the middle and smaller toward its ends
-        const layer = bank % CLOUD_LAYERS.length, x = random(-.5, .5)*CLOUD_BOX, z = random(-.5, .5)*CLOUD_BOX;
-        const puffs = 4 + (random()*4 | 0), across = random(-.4, .4), shade = random(.85, 1.1);
-        for (let i = 0; i < puffs; ++i)
+        const spacing = CLOUD_BOX/deck.grid;
+        for (let j = 0; j < deck.grid; ++j)
+        for (let i = 0; i < deck.grid; ++i)
         {
-            const along = (i/(puffs - 1) - .5)*random(60, 100), middle = 1 - Math.abs(i/(puffs - 1) - .5);
-            clouds.push({bank, layer, variant: (bank + i*3) % CLOUD_VARIANTS,
-                x: x + Math.cos(across)*along + random(-8, 8), y: CLOUD_LAYERS[layer] + random(-2.5, 2.5) + middle*1.5,
-                z: z + Math.sin(across)*along + random(-12, 12), size: random(50, 70) + middle*40,
-                shade: shade*random(.92, 1.05), alpha: random(.8, .95), mirror: random() < .5});
+            // every other row stands half a step along, so the rows never line up into streets
+            const size = spacing*random(deck.size[0], deck.size[1]), foot = CLOUD_BASE_Y + deck.foot + random(0, deck.rise);
+            clouds.push({deck: d, variant: (i + j*deck.grid + d)*5 % CLOUD_VARIANTS,
+                x: (i + .5 + j % 2*.5 + random(-.06, .06))*spacing - CLOUD_BOX/2,
+                y: foot + size/2*(.5 - CLOUD_FOOT), // a sprite is half as tall as it is wide
+                z: (j + .5 + random(-.06, .06))*spacing - CLOUD_BOX/2,
+                size, shade: deck.shade*random(.88, 1.08), alpha: random(.9, 1), mirror: random() < .5});
         }
-    }
+    });
     return clouds;
 }
 
 function cloudPosAt(cloud, t)
 {
     const wrap = v => ((v + CLOUD_BOX/2) % CLOUD_BOX + CLOUD_BOX) % CLOUD_BOX - CLOUD_BOX/2;
-    const d = CLOUD_SPEEDS[cloud.layer]*t;
-    return {x: wrap(cloud.x + WIND_DIR[0]*d), y: cloud.y, z: wrap(cloud.z + WIND_DIR[1]*d)};
+    const x = wrap(cloud.x + WIND_DIR[0]*CLOUD_SPEED*t), z = wrap(cloud.z + WIND_DIR[1]*CLOUD_SPEED*t);
+    const edge = CLOUD_BOX/2 - Math.max(Math.abs(x), Math.abs(z));
+    return {x, y: cloud.y, z, fade: Math.min(Math.max(edge/CLOUD_FADE, 0), 1)};
 }
 // CLOUDS END
 
-// colors for lit billboards: each is lit by the ambient, the low warm sun and any lightning near it, so the color
-// here is darker than it shows; the higher layers a little darker and bluer. The shapes carry their own light baked
-// in, bright lumpy tops and a dark flat underside, so they read as clouds before the lightning finds them
-const CLOUD_COLORS = [rgb(.68,.72,1), rgb(.62,.67,.97), rgb(.56,.61,.92)];
-const CLOUD_EMISSIVE = .55; // the share of a puff's color it keeps unlit, so the dark side never goes muddy
-const CLOUD_CELL = vec2(256, 128); // each baked shape's cell in the cloud texture, side by side
+// the color a cloud's sprite is drawn in: lit by the ambient, the low warm sun and any lightning near it, so it is
+// darker than it shows. The sprites carry their own light baked in, bright tops shading down to a dark flat foot,
+// so they read as clouds before the lightning finds them
+const CLOUD_COLOR = rgb(.8,.84,1);
+const CLOUD_EMISSIVE = .6; // the share of its color a cloud keeps unlit, so the dark side never goes muddy
+const CLOUD_CELL = vec2(512, 256); // each baked shape's cell in the cloud texture
 let clouds, cloudTiles = [], puffTile, glowTile;
 
 // a soft round puff, white fading to clear, for the spray and the mist
@@ -737,73 +807,86 @@ function makeGlowTexture()
     return new TextureInfo(canvas);
 }
 
-// the cloud shapes, drawn once side by side: each a heap of round lumps on a flat base, every lump lit from above
-// so its top is bright and its foot dim, drawn top first so the lower lumps stand out against the shade above them,
-// then the whole underside pulled down toward the storm's blue gray
+// the cloud shapes, worked out once, pixel by pixel. A cloud is a thickness: a domed outline with a wandering top
+// and a flat foot, swollen and pinched by a field of round lumps (one less the distance to the nearest of a scatter
+// of points, big ones and small) and frayed by fine noise, so its edge billows instead of tracing circles. Its light
+// is the sun's from above: each pixel is dimmed by how much cloud lies over it, and the lumps catch the light on
+// their upper left, so the top is bright, the body rounded and the foot dark
 function buildClouds()
 {
-    const w = CLOUD_CELL.x, h = CLOUD_CELL.y, canvas = document.createElement('canvas');
-    canvas.width = w*CLOUD_VARIANTS, canvas.height = h;
-    const context = canvas.getContext('2d'), random = new RandomGenerator(7);
+    const w = CLOUD_CELL.x, h = CLOUD_CELL.y, columns = 3, canvas = document.createElement('canvas');
+    canvas.width = w*columns, canvas.height = h*Math.ceil(CLOUD_VARIANTS/columns);
+    const context = canvas.getContext('2d');
+    const hash = (i, j, k) => { const v = Math.sin(i*127.1 + j*311.7 + k*74.7)*43758.5453; return v - Math.floor(v); };
+    const lumps = (x, y, k) =>
+    {
+        const i = Math.floor(x), j = Math.floor(y);
+        let best = 9;
+        for (let a = -1; a <= 1; ++a)
+        for (let b = -1; b <= 1; ++b)
+        {
+            const dx = i + a + hash(i + a, j + b, k) - x, dy = j + b + hash(i + a, j + b, k + 1) - y;
+            best = Math.min(best, dx*dx + dy*dy);
+        }
+        return 1 - Math.min(1, Math.sqrt(best));
+    };
+    const ease = v => { v = clamp(v); return v*v*(3 - 2*v); };
+    const density = new Float32Array(w*h), relief = new Float32Array(w*h), light = new Float32Array(w*h);
     for (let v = 0; v < CLOUD_VARIANTS; ++v)
     {
-        const left = v*w, base = h*.8, lumps = [];
-        context.save();
-        context.beginPath();
-        context.rect(left, 0, w, h);
-        context.clip();
-        // the lumps: big ones in the middle, smaller toward the sides, sitting on the base line
-        const count = 26 + v*4;
-        for (let i = 0; i < count; ++i)
+        for (let y = 0; y < h; ++y)
+        for (let x = 0; x < w; ++x)
         {
-            const across = random.float(-1, 1), middle = 1 - Math.abs(across);
-            const r = h*(.1 + .17*middle*random.float(.6, 1.2));
-            const x = left + w/2 + across*(w/2 - r - 4), y = base - r*random.float(.2, .9) - middle*h*.22*random.float(.4, 1);
-            lumps.push({x, y, r});
+            // across -1 to 1, up 0 at the sprite's bottom to 1 at its top, and the place in units of its height
+            const across = (x + .5)/w*2 - 1, up = 1 - (y + .5)/h, px = x/h, py = y/h;
+            const wander = islandNoise(px*1.6 + v*13, v*7.3)*.6 + islandNoise(px*4 + v*5, v*3.1)*.4;
+            const top = CLOUD_FOOT + (CLOUD_BODY + .1 - CLOUD_FOOT)*Math.max(0, 1 - across*across)**.55*(.45 + .55*wander);
+            const lump = lumps(px*4.5 + v*9, py*4.5, v)*.65 + lumps(px*10 + v*4, py*10, v + 5)*.35;
+            const fine = islandNoise(px*14 + v, py*14)*.6 + islandNoise(px*30, py*30 + v)*.4;
+            let d = (top - up)*4 + (lump - .5)*1.1 + (fine - .5)*.3;
+            d = Math.min(d, (up - CLOUD_FOOT)*8 + (fine - .5)*.8 + .1, (1 - Math.abs(across))*8);
+            density[y*w + x] = ease(d/.65);
+            relief[y*w + x] = lump + fine*.25;
         }
-        lumps.sort((a, b) => (a.y - a.r) - (b.y - b.r));
-        for (const {x, y, r} of lumps)
+        // the light left after coming down through the cloud above, softened sideways so no column shows
+        for (let x = 0; x < w; ++x)
+            for (let y = 0, over = 0; y < h; ++y)
+                light[y*w + x] = Math.exp(-over*4.2), over += density[y*w + x]/h;
+        for (let pass = 0; pass < 2; ++pass)
+        for (let y = 0; y < h; ++y)
         {
-            const g = context.createRadialGradient(x - r*.2, y - r*.5, r*.05, x, y + r*.1, r);
-            g.addColorStop(0, 'rgba(255,255,255,1)');
-            g.addColorStop(.5, 'rgba(214,216,230,1)');
-            g.addColorStop(.85, 'rgba(170,174,196,.85)');
-            g.addColorStop(1, 'rgba(170,174,196,0)');
-            context.fillStyle = g;
-            context.beginPath();
-            context.arc(x, y, r, 0, 2*PI);
-            context.fill();
+            let sum = 0;
+            const row = light.slice(y*w, y*w + w), R = 5;
+            for (let x = -R; x < w; ++x)
+            {
+                x + R < w && (sum += row[x + R]);
+                x - R - 1 >= 0 && (sum -= row[x - R - 1]);
+                x >= 0 && (light[y*w + x] = sum/(Math.min(w - 1, x + R) - Math.max(0, x - R) + 1));
+            }
         }
-        // the shade underneath, a silver edge along the tops, and the base melting into the air instead of a hard line
-        context.globalCompositeOperation = 'source-atop';
-        const top = context.createLinearGradient(0, 0, 0, h*.5);
-        top.addColorStop(0, 'rgba(255,255,255,.5)');
-        top.addColorStop(1, 'rgba(255,255,255,0)');
-        context.fillStyle = top;
-        context.fillRect(left, 0, w, h);
-        const shade = context.createLinearGradient(0, h*.25, 0, h);
-        shade.addColorStop(0, 'rgba(36,40,70,0)');
-        shade.addColorStop(.5, 'rgba(36,40,70,.55)');
-        shade.addColorStop(1, 'rgba(22,24,46,.92)');
-        context.fillStyle = shade;
-        context.fillRect(left, 0, w, h);
-        context.globalCompositeOperation = 'destination-out';
-        const fade = context.createLinearGradient(0, base - h*.1, 0, base + h*.12);
-        fade.addColorStop(0, 'rgba(0,0,0,0)');
-        fade.addColorStop(1, 'rgba(0,0,0,1)');
-        context.fillStyle = fade;
-        context.fillRect(left, 0, w, h);
-        context.restore();
+        const image = context.createImageData(w, h), data = image.data;
+        for (let y = 0; y < h; ++y)
+        for (let x = 0; x < w; ++x)
+        {
+            const i = y*w + x, x0 = Math.max(x - 2, 0), x1 = Math.min(x + 2, w - 1), y0 = Math.max(y - 2, 0), y1 = Math.min(y + 2, h - 1);
+            // the lumps' slope toward the light, up and to the left
+            const slope = (relief[y*w + x0] - relief[y*w + x1])*.45 + (relief[y0*w + x] - relief[y1*w + x])*.9;
+            // thin edges let the light through, the silver lining
+            const b = clamp(light[i]*(.5 + .5*clamp(.5 + slope*5) + .35*(1 - density[i])));
+            data[i*4] = 52 + 203*b, data[i*4 + 1] = 56 + 199*b, data[i*4 + 2] = 90 + 165*b;
+            data[i*4 + 3] = 255*density[i];
+        }
+        context.putImageData(image, v % columns*w, (v/columns | 0)*h);
     }
     const texture = new TextureInfo(canvas);
     for (let v = 0; v < CLOUD_VARIANTS; ++v)
-        cloudTiles.push(new TileInfo(vec2(v*w, 0), CLOUD_CELL, texture, 0, 1));
+        cloudTiles.push(new TileInfo(vec2(v % columns*w, (v/columns | 0)*h), CLOUD_CELL, texture, 0, 1));
     puffTile = makePuffTexture();
     glowTile = makeGlowTexture();
     clouds = cloudLayout(stormSeed);
 }
 
-// in the transparent stage, sorted far to near by the engine with the rest; lit, so a strike lights the puffs
+// in the transparent stage, sorted far to near by the engine with the rest; lit, so a strike lights the clouds
 // round it. The ones toward the last light take its warmth
 function drawClouds()
 {
@@ -811,11 +894,12 @@ function drawClouds()
     render3D.emissive = CLOUD_EMISSIVE;
     for (const c of clouds)
     {
-        const p = cloudPosAt(c, stormTime), base = CLOUD_COLORS[c.layer];
+        const p = cloudPosAt(c, stormTime);
+        if (!p.fade) continue;
         let da = Math.atan2(p.x - camera.x, -(p.z - camera.z)) - SUN_AZIMUTH;
         da = Math.atan2(Math.sin(da), Math.cos(da));
-        const warm = Math.max(0, 1 - Math.abs(da)/1.2)**2*.3;
-        const color = rgb(base.r*c.shade*(1 + warm*.7), base.g*c.shade*(1 + warm*.2), base.b*c.shade*(1 - warm*.2), c.alpha);
+        const warm = Math.max(0, 1 - Math.abs(da)/1.2)**2*.3, k = c.shade;
+        const color = rgb(CLOUD_COLOR.r*k*(1 + warm*.7), CLOUD_COLOR.g*k*(1 + warm*.2), CLOUD_COLOR.b*k*(1 - warm*.2), c.alpha*p.fade);
         render3D.drawBillboard(vec3(p.x, p.y, p.z), vec2(c.size*(c.mirror ? -1 : 1), c.size/2), cloudTiles[c.variant], color);
     }
     render3D.emissive = 0;
@@ -1004,15 +1088,13 @@ class Rain extends InstancedMesh3D
 // spray on the windward rocks: each time a swell climbs past one, it bursts up the rock's face and over it downwind,
 // a sheet of droplets streaking as they fall, a cloud of spray the wind carries off, and foam churning at its foot.
 // The wind is the particles' share of the world's gravity, set sideways, as nothing else here has a mass
-const SPRAY_ROCKS = 6, SPRAY_LEAN = .5; // how many of the upwind boulders, and how far the burst leans downwind
+const SPRAY_LEAN = .5; // how far a burst leans downwind
 let sprayRocks = [];
 function buildSpray()
 {
     render3D.gravity = vec3(WIND_DIR[0]*.0016, 0, WIND_DIR[1]*.0016);
-    const upwind = r => r.x*WIND_DIR[0] + r.z*WIND_DIR[1];
-    sprayRocks = rockLayout(1).filter(r => r.kind == 'boulder').sort((a, b) => upwind(a) - upwind(b)).slice(0, SPRAY_ROCKS)
-        .map((rock, i) => ({rock, level: .35 + .12*i, last: 0, lastBurst: -9,
-            face: vec3(rock.x - WIND_DIR[0]*rock.sx*.4, 0, rock.z - WIND_DIR[1]*rock.sz*.4)}));
+    sprayRocks = islandSprayPoints(WIND_DIR[0], WIND_DIR[1]).map((p, i) =>
+        ({level: .3 + .13*(i*3 % 5), last: 0, lastBurst: -9, face: vec3(p.x, 0, p.z)}));
 }
 
 function sprayBurst(spray, rise)
@@ -1055,7 +1137,7 @@ function updateSpray()
 // out on the sea if it does neither within reach, so every click strikes somewhere.
 
 const STRIKE_REACH = 400;   // meters across the sea a click can reach
-const TOWER_RADIUS = 2.6, MOUND_RADIUS = 9;
+const TOWER_RADIUS = 2.6, MOUND_RADIUS = 11;
 
 function resolveStrike(ox, oy, oz, dx, dy, dz)
 {
@@ -1071,7 +1153,7 @@ function resolveStrike(ox, oy, oz, dx, dy, dz)
     const at = (t, kind) => ({kind, x: ox + dx*t, y: Math.max(0, oy + dy*t), z: oz + dz*t});
 
     const tower = cylinder(TOWER_RADIUS, SHELF_Y, TOWER_HEIGHT);
-    const mound = cylinder(Math.min(MOUND_RADIUS, ISLAND_RADIUS), -1, SHELF_Y);
+    const mound = cylinder(MOUND_RADIUS, -1, SHELF_Y);
     if (tower !== undefined && (mound === undefined || tower < mound))
         return {kind: 'tower', x: 0, y: TOWER_HEIGHT, z: 0};
     if (mound !== undefined)
