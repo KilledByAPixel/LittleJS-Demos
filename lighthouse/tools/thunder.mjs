@@ -23,8 +23,8 @@ makeSchedule(() => 0, true).forEach((strike, i) =>
     const camera = cameraPathAt(strike.t).pos, cloud = strike.kind == 'cloud';
     const distance = Math.hypot(strike.x - camera.x, (cloud ? CLOUD_BASE_Y + 8 : 0) - camera.y, strike.z - camera.z);
     const delay = thunderDelay(distance), loud = thunderLoudness(distance), size = strike.big ? 1.4 : .75;
-    add(thunderCrack(i % 3 + 1), strike.t + delay, loud.crack*(cloud ? .5 : 1)*size*4.5);
-    add(thunderRoll(i % 3 + 1), strike.t + delay, loud.roll*size*2.2);
+    add(thunderCrack(i + 1), strike.t + delay, loud.crack*(cloud ? .5 : 1)*size*4.5);
+    add(thunderRoll(i + 1), strike.t + delay, loud.roll*size*2.2);
     console.log(`strike at ${strike.t}s, ${distance.toFixed(0)}m off, heard ${delay.toFixed(2)}s later`);
 });
 

@@ -32,6 +32,27 @@ for (let lag = 3; lag <= 40; ++lag)
     flutter = Math.max(flutter, same/power);
 }
 check(flutter < .45, `the roll has no steady flutter on it (${flutter.toFixed(2)})`);
+// the rumble has to be heard on small speakers, which carry little under 250Hz: with everything lower taken out,
+// every roll must still be sounding seconds after its start, and swell again at least once, a peal coming back
+const middle = d => { const k = 1 - Math.exp(-2*Math.PI*250/SOUND_RATE), o = new Float32Array(d.length); let low = 0; d.forEach((v, i) => { low += k*(v - low); o[i] = v - low; }); return o; };
+let heard = 9, pealed = true;
+for (let seed = 1; seed <= 7; ++seed)
+{
+    const m = middle(thunderRoll(seed));
+    heard = Math.min(heard, rms(m, 1.5, 4)/rms(m, 0, .5));
+    let rose = false;
+    for (let t = .5; t < 4; t += .1) rms(m, t, t + .15) > rms(m, t - .25, t - .1)*1.4 && (rose = true);
+    pealed &&= rose;
+}
+check(heard > .12, `every roll still rumbles in the middle range seconds on (${heard.toFixed(2)} of its start)`);
+check(pealed, 'and every roll swells again after its start, a peal coming back');
+// no two strikes alike: the cracks differ in how their loudness runs, not only in their noise
+const curve = d => Array.from({length: 40}, (_, i) => rms(d, i*.015, i*.015 + .015));
+const alike = (p, q) => { let pq = 0, pp = 0, qq = 0; p.forEach((v, i) => { pq += v*q[i]; pp += v*v; qq += q[i]*q[i]; }); return pq/Math.sqrt(pp*qq); };
+const curves = [1, 2, 3, 4, 5, 6, 7].map(seed => curve(thunderCrack(seed)));
+let closest = 0;
+curves.forEach((p, i) => curves.forEach((q, j) => i < j && (closest = Math.max(closest, alike(p, q)))));
+check(closest < .985, `the cracks are shaped differently from one another (the two most alike match ${closest.toFixed(3)})`);
 check(JSON.stringify([...thunderCrack(1).slice(0, 2000)]) === JSON.stringify([...crack.slice(0, 2000)]), 'the same seed gives the same thunder');
 check(JSON.stringify([...thunderRoll(2).slice(0, 2000)]) !== JSON.stringify([...roll.slice(0, 2000)]), 'another seed another');
 check(thunderDelay(100) >= .4 && thunderDelay(100) <= .8, `a strike 100m off is heard a good half second after it is seen (${thunderDelay(100).toFixed(2)}s)`);
