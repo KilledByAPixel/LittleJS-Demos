@@ -557,9 +557,13 @@ function buildCottage()
     const yaw = -.5, pos = vec3(PAD.x, SHELF_Y, PAD.z);
     const mesh = buildBox(vec3(4.6, 2.8, 3.6), .08).setColor(rgb(.72,.70,.66));
     mesh.transform(buildMatrix(vec3(0, 1.4, 0)));
-    // the roof: a long box turned on its edge, then squashed, so its gable overhangs the walls all round
-    const roof = buildBox(vec3(3.5, 3.5, 4.1), .05).transform(buildMatrix(vec3(), vec3(0, 0, PI/4)));
-    mesh.combine(roof.transform(buildMatrix(vec3(0, 2.8, 0), undefined, vec3(1, .45, 1))), undefined, rgb(.22,.24,.3));
+    // the roof: a gable, flat underneath, its eaves and its ends overhanging the walls all round. Six corners, the
+    // two eaves and the ridge at each end, and the triangles over them: the ends, the two slopes and the underside
+    const w = 2.5, h = 1.3, l = 2.05, eaves = 2.7;
+    const roof = new Mesh().addTriangles(
+        [vec3(-w, eaves, -l), vec3(w, eaves, -l), vec3(0, eaves + h, -l), vec3(-w, eaves, l), vec3(w, eaves, l), vec3(0, eaves + h, l)],
+        [3,4,5, 1,0,2, 4,1,2, 4,2,5, 0,3,5, 0,5,2, 0,1,4, 0,4,3]).computeNormals(false);
+    mesh.combine(roof, undefined, rgb(.22,.24,.3));
     mesh.combine(buildBox(vec3(.6, 1.6, .6)), vec3(1.3, 3.7, .6), rgb(.5,.47,.44)); // chimney
     mesh.combine(buildBox(vec3(4.8, .5, 3.8)), vec3(0, .25, 0), rgb(.45,.44,.44));  // a footing of darker stone
     mesh.combine(buildBox(vec3(.9, 1.8, .14)), vec3(-1.25, .9, 1.8), rgb(.24,.17,.13)); // the door
