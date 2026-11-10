@@ -830,7 +830,9 @@ function makeSplash(pos, big)
     mist.emitSize = 5*k, mist.angleSpeed = .008, mist.emissive = .15;
     mist.gravityScale = 1;
     ripples.push({x: pos.x, z: pos.z, start: time, k});
-    soundStarted && crashSound.play(undefined, .5*k, rand(.6, .8));
+    // the splash is heard when the thunder is, just after its crack: sound from out there all takes the same time
+    const distance = render3D.camera.pos.distance(at);
+    recordMode || thunderDue.push({at: time + thunderDelay(distance) + .12, crash: .7*k*thunderLoudness(distance).roll});
 }
 
 // the foam rings, drawn as puffs round a widening circle on the moving water
@@ -1391,7 +1393,7 @@ function thunderCrack(seed)
 {
     const white = soundNoise(seed), random = soundNoise(seed + 77), n = SOUND_RATE*.9 | 0, out = new Float32Array(n);
     // the snap, and after it a dozen or so lesser ones at uneven times, thinning out and weakening
-    const snaps = [{t: 0, gain: 1.6, fall: .005}, {t: 0, gain: 1, fall: .06}];
+    const snaps = [{t: 0, gain: 1.6, fall: .005}, {t: 0, gain: 1, fall: .1}];
     for (let t = .02; t < .55; t += .012 + (random() + 1)*.035)
         snaps.push({t, gain: (.25 + .3*(random() + 1))*Math.exp(-t/.22), fall: .006 + .012*(random() + 1)});
     // everything under 250Hz taken out, so it is a crack and not a thud, and all the top left in for its edge
@@ -1403,9 +1405,10 @@ function thunderCrack(seed)
         let loud = 0;
         for (const k of snaps) t >= k.t && (loud += k.gain*Math.exp(-(t - k.t)/k.fall));
         under += bottom*(v - under);
-        out[i] = (v - under)*loud;
+        // the edge, and with the first snap a thump from what was taken out, the weight of a strike close by
+        out[i] = (v - under)*loud + under*6*Math.exp(-t/.07);
     }
-    return soundFinish(out, 3);
+    return soundFinish(out, 4);
 }
 
 function thunderRoll(seed)
@@ -1498,8 +1501,8 @@ function buildSounds()
 function queueThunder(kind, pos, big)
 {
     if (recordMode) return;
-    const distance = render3D.camera.pos.distance(pos), loud = thunderLoudness(distance), size = big ? 1 : .7;
-    thunderDue.push({at: time + thunderDelay(distance), crack: loud.crack*(kind == 'cloud' ? .5 : 1)*size*3, roll: loud.roll*size*2.2});
+    const distance = render3D.camera.pos.distance(pos), loud = thunderLoudness(distance), size = big ? 1.4 : .75;
+    thunderDue.push({at: time + thunderDelay(distance), crack: loud.crack*(kind == 'cloud' ? .5 : 1)*size*4.5, roll: loud.roll*size*2.2});
 }
 
 function updateSound()
@@ -1517,6 +1520,7 @@ function updateSound()
         if (thunder.at > time) continue;
         thunderDue.splice(thunderDue.indexOf(thunder), 1);
         if (!soundStarted) continue;
+        if (thunder.crash) { crashSound.play(undefined, thunder.crash, rand(.6, .8)); continue; }
         crackSounds[randInt(crackSounds.length)].play(undefined, thunder.crack, rand(.9, 1.1));
         rollSounds[randInt(rollSounds.length)].play(undefined, thunder.roll, rand(.85, 1.1));
     }
