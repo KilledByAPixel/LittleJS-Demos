@@ -9,7 +9,7 @@ Each demo is a self-contained folder with its own copy of the engine, so it runs
 
 A lighthouse on a rocky islet in a blue-hour storm, in LittleJS 3D. Rain streaks through the turning beam, swells burst into spray on the rocks, and lightning lights the clouds, the sea and the rocks from where it strikes.
 
-- **Click**: lightning where you point, on the sea, the clouds, or the lighthouse itself
+- **Click**: lightning where you point, on the sea, the clouds, or the lighthouse itself (the first click also starts the sound)
 - **F**: free camera (WASD to move, drag to look, Q/E down and up, Shift faster)
 - **R**: a new storm
 - **Space**: slow motion

@@ -750,6 +750,7 @@ function startStrike(kind, pos, big=false, at=stormTime)
     const toVec = list => list.map(p => vec3(p.x, p.y, p.z));
     strikes.push({kind, start: at, big, lights, main: toVec(bolt.main),
         branches: bolt.branches.map(b => ({points: toVec(b.points), weight: b.weight}))});
+    queueThunder(kind, pos, big);
 }
 
 // each frame: start what the schedule says is due, and drive every live strike's lights by its flicker
@@ -831,6 +832,7 @@ function makeSplash(pos, big)
     mist.emitSize = 5*k, mist.angleSpeed = .008, mist.emissive = .15;
     mist.gravityScale = 1;
     ripples.push({x: pos.x, z: pos.z, start: time, k});
+    soundStarted && crashSound.play(undefined, .5*k, rand(.6, .8));
 }
 
 // the foam rings, drawn as puffs round a widening circle on the moving water
@@ -1279,6 +1281,7 @@ function sprayBurst(spray, rise)
     mist.angleSpeed = .008, mist.gravityScale = 1, mist.emissive = .15;
     const foam = emit(sprayTiles[randInt(4)], vec3(4, .3, 4), .15, 60*k, PI/2.2, rgb(.85,.9,1,.5), rgb(.75,.82,.95,.4), 1.4, 2, 5, .05, .95, -.002);
     foam.gravityScale = .3, foam.emissive = .12;
+    soundStarted && crashSound.play(undefined, .22*k, rand(.8, 1.25));
 }
 
 function updateSpray()
@@ -1357,6 +1360,99 @@ function clickStrike()
     startStrike(s.kind == 'cloud' ? 'cloud' : 'ground', vec3(p.x, p.y, p.z), s.kind == 'tower');
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// the storm's sound, all of it worked out here from noise and handed to the engine as sounds, no files: the rain,
+// the wind and the sea's surge as loops, a thunder crack with its echoes off the water and a boom that rolls on
+// after it, and the crash of a swell on rock. A browser only lets sound start after a click or a key, so it does
+const SOUND_RATE = 44100, SOUND_SPEED = 343; // samples a second, and how fast thunder crosses the sea, meters a second
+let soundStarted = false, rainSound, seaSound, crackSound, boomSound, crashSound, rainPlaying;
+const thunderDue = [];
+
+function buildSounds()
+{
+    let seed = 99;
+    const white = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0)/2147483648 - 1; };
+    // noise with only what lies between two frequencies left in, shaped over its length by a loudness curve
+    const band = (seconds, low, high, shape) =>
+    {
+        const n = seconds*SOUND_RATE | 0, out = new Float32Array(n);
+        const a = 1 - Math.exp(-2*PI*high/SOUND_RATE), b = 1 - Math.exp(-2*PI*low/SOUND_RATE);
+        let pass = 0, pass2 = 0, under = 0, peak = 0;
+        for (let i = 0; i < n; ++i)
+        {
+            pass += a*(white() - pass), pass2 += a*(pass - pass2), under += b*(pass2 - under);
+            out[i] = (pass2 - under)*shape(i/SOUND_RATE);
+            peak = Math.max(peak, Math.abs(out[i]));
+        }
+        for (let i = 0; i < n; ++i) out[i] /= peak;
+        return out;
+    };
+    // a sound with its echoes: the same again, later and quieter, each [seconds, loudness]
+    const echoed = (data, tail, echoes) =>
+    {
+        const out = new Float32Array(data.length + tail*SOUND_RATE);
+        out.set(data);
+        for (const [delay, gain] of echoes)
+            for (let i = 0, k = delay*SOUND_RATE | 0; i < data.length; ++i) out[i + k] += data[i]*gain;
+        return out;
+    };
+    // a loop: the last stretch faded into the first, so it goes round with no seam
+    const loop = (data, blend) =>
+    {
+        const m = blend*SOUND_RATE | 0, n = data.length - m;
+        for (let i = 0; i < m; ++i) data[i] = data[i]*i/m + data[n + i]*(1 - i/m);
+        return data.subarray(0, n);
+    };
+    const sound = (data, loudness) =>
+    {
+        const made = new Sound;
+        made.sampleRate = SOUND_RATE;
+        made.sampleChannels = [data.map(v => v*loudness)];
+        return made;
+    };
+    rainSound = sound(loop(band(6.5, 1200, 9000, () => 1), .5), .5);
+    // the wind, and under it the sea surging on the long swell's period, two swells a loop
+    const swell = 2*PI/(WAVES[0].k*WAVES[0].speed);
+    seaSound = sound(loop(band(swell*2 + .5, 40, 600, t => .45 + .55*(.5 + .5*Math.sin(2*PI*t/swell))**3), .5), .6);
+    // the crack: a sharp tearing burst in the middle of the hearing range, crackling, gone in a fifth of a second
+    crackSound = sound(echoed(band(.55, 220, 5200, t => Math.exp(-t/.1)*(1 - .75*(.5 + .5*Math.sin(2*PI*38*t)))), 1.6,
+        [[.15, .5], [.34, .36], [.64, .24], [1.1, .14]]), .6);
+    // the boom: low, rolling, seconds long, wide enough that small speakers still carry it
+    boomSound = sound(echoed(band(5, 45, 700, t => Math.min(1, t/.06)*(1 - t/5)**2*(.45 + .55*Math.sin(2*PI*5*t)**2)), 2.2,
+        [[.9, .45], [1.9, .3]]), .6);
+    crashSound = sound(band(1.8, 300, 4500, t => Math.min(1, t/.07)*Math.exp(-t/.4)), .5);
+}
+
+// a strike's thunder, heard when its sound has crossed the sea to the camera: up in the cloud mostly boom, down
+// to the sea a hard crack first, the big one louder, all of it fainter from further off
+function queueThunder(kind, pos, big)
+{
+    if (recordMode) return;
+    const distance = render3D.camera.pos.distance(pos), near = 1/(1 + distance/300), size = big ? 1 : .7;
+    thunderDue.push({at: time + distance/SOUND_SPEED, crack: (kind == 'cloud' ? .3 : 1)*near*size, boom: near*size});
+}
+
+function updateSound()
+{
+    if (recordMode) return;
+    if (!soundStarted && (mouseWasPressed(0) || keyWasPressed('Space') || keyWasPressed('KeyF') || keyWasPressed('KeyR')))
+    {
+        soundStarted = true;
+        rainPlaying = rainSound.playLoop(undefined, .5);
+        seaSound.playLoop(undefined, .9);
+    }
+    // the thunder that is due, each a little different in pitch; what fell due before the sound began is let go
+    for (const thunder of [...thunderDue])
+    {
+        if (thunder.at > time) continue;
+        thunderDue.splice(thunderDue.indexOf(thunder), 1);
+        if (!soundStarted) continue;
+        crackSound.play(undefined, thunder.crack, rand(.85, 1.15));
+        boomSound.play(undefined, thunder.boom, rand(.8, 1.1));
+    }
+    cinematic && rainPlaying?.setVolume(.5*cineRainRate(stormTime));
+}
+
 const CAM_FOV = .9; // radians, a touch long so the tower doesn't lean
 // free cam: F flies it (WASD, drag to look, Q/E down and up, Shift faster), meters a second and radians a pixel
 const FREE_CAM_SPEED = 12, FREE_CAM_FAST = 40, FREE_CAM_TURN = .004;
@@ -1418,6 +1514,7 @@ function gameInit()
     rain = new Rain;
     buildSpray();
     buildPost();
+    recordMode || buildSounds();
     scheduleStrikes();
     render3D.camera.fov = CAM_FOV;
     render3D.camera.far = 2000;
@@ -1450,6 +1547,7 @@ function gameUpdate()
     rain.step(slowMo ? 1/240 : 1/60);
     updateSpray();
     updatePost();
+    updateSound();
 }
 
 function gameUpdatePost() {}
